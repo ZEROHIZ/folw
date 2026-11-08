@@ -114,4 +114,18 @@
   2. 在 [`TokenBrowser._create_browser`](src/services/browser_captcha.py) 中移除 `--disable-background-networking` 并启用 `--disable-background-timer-throttling`；在 `_warmup_browser_slot` 与 [`TokenBrowser.refresh_google_cookies`](src/services/browser_captcha.py) 中让 `_shared_keepalive_page` 常驻 `https://flow.google.com/projects`，刷新时先经过 `accounts.google.com/ServiceLogin?passive=true&continue=https%3A%2F%2Fflow.google.com%2Fprojects` 完成联合续期并同步更新 `_shared_bound_cookie_signature`。
   3. 在 [`TokenManager._try_refresh_st`](src/services/token_manager.py) 中改为直接调用 `await BrowserCaptchaService.get_instance(self.db)`，并将默认刷新周期调优为 15 分钟。
 
+## 2026-11-09：旧数据库缺失 `browser_launch_background` 字段与 CloakBrowser 环境检测/一键安装面板
+
+- **现象**：
+  1. 挂载旧版 `data/flow2api.db` 的 Docker 容器在保存验证码配置时报错 `sqlite3.OperationalError: no such column: browser_launch_background`。
+  2. Docker 容器或首次部署环境中，切换到 `CloakBrowser打码` 后未自动安装 Pro 内核，且前端页面缺少直观的环境状态检测、一键安装按钮与实时安装进度面板。
+- **根因**：
+  1. [`Database.init_db`](src/core/database.py) 仅对 `tokens` 等表执行了增量 `ALTER TABLE ADD COLUMN`，漏掉了 `captcha_config.browser_launch_background` 的自动迁移。
+  2. [`_prepare_captcha_runtime("cloakbrowser")`](src/api/admin.py) 在未检测到内核文件时直接抛出异常终止，未主动触发 [`setup_cloakbrowser.py`](setup_cloakbrowser.py) 下载内核；同时 [`static/manage.html`](static/manage.html) 仅在右下角弹短暂 Toast，没有常驻面板展示环境检测结果和实时下载日志。
+- **修复方案**：
+  1. 在 [`src/core/database.py`](src/core/database.py) 的 `init_db()` 与 `update_captcha_config()` 中补齐 `_migrate_columns_for_table` 自动字段迁移（使用标准 `print` 输出避免未定义 logger 变量）。
+  2. 在 [`src/services/browser_captcha.py`](src/services/browser_captcha.py) 中新增 `get_cloakbrowser_env_status()` 与 `install_cloakbrowser_runtime()`，在 [`src/api/admin.py`](src/api/admin.py) 新增 `GET /api/captcha/cloakbrowser/status` 与 `POST /api/captcha/cloakbrowser/install` 接口，并在保存 `cloakbrowser` 配置且缺失内核时自动调用 `setup_cloakbrowser.py` 下载安装（同时在打码执行阶段保持严格校验、绝不回退普通 Chromium）。
+  3. 在 [`static/manage.html`](static/manage.html) 的「CloakBrowser打码」配置区新增「🔍 检测环境」与「⬇️ 一键安装/修复内核」按钮及实时状态/进度面板。
+
+
 

@@ -13,8 +13,31 @@ import sys
 from pathlib import Path
 
 
+def ensure_cloakbrowser_pip_package() -> None:
+    """确保当前 Python 环境中已安装 cloakbrowser 依赖包。"""
+    try:
+        import cloakbrowser  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    print("[*] 未检测到 cloakbrowser Python 包，正在自动安装...")
+    for mirror in (None, "https://pypi.tuna.tsinghua.edu.cn/simple"):
+        cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "cloakbrowser"]
+        if mirror:
+            cmd.extend(["-i", mirror])
+        res = subprocess.run(cmd)
+        if res.returncode == 0:
+            import importlib
+            importlib.invalidate_caches()
+            print("[✓] cloakbrowser Python 包安装成功")
+            return
+    raise RuntimeError("cloakbrowser Python 包自动安装失败，请检查网络连接。")
+
+
 def patch_cloakbrowser_package() -> Path:
     """对当前 Python 环境中的 cloakbrowser 包应用本地缓存目录与直连下载分流补丁。"""
+    ensure_cloakbrowser_pip_package()
     import cloakbrowser
     import cloakbrowser.config as cb_config
     import cloakbrowser.download as cb_download

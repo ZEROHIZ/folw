@@ -535,6 +535,34 @@
                                 </label>
                                 <p class="text-xs text-muted-foreground mt-1"><span data-i18n="开启后自动最小化并移至屏幕外静默运行；关闭后将在桌面显示浏览器窗口，方便实时观察调试">开启后自动最小化并移至屏幕外静默运行；关闭后将在桌面显示浏览器窗口，方便实时观察调试</span></p>
                             </div>
+
+                            <div class="pt-3 border-t border-border space-y-2.5">
+                                <div class="flex flex-wrap items-center justify-between gap-2">
+                                    <span class="text-sm font-medium"><span data-i18n="CloakBrowser 运行环境与内核状态">CloakBrowser 运行环境与内核状态</span></span>
+                                    <div class="flex items-center gap-2">
+                                        <button type="button" id="btnCheckCloakbrowser" onclick="checkCloakbrowserEnv()" class="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent h-8 px-3 text-xs font-medium transition-colors">
+                                            🔍 <span class="ml-1" data-i18n="检测环境">检测环境</span>
+                                        </button>
+                                        <button type="button" id="btnInstallCloakbrowser" onclick="installCloakbrowserKernel()" class="inline-flex items-center justify-center rounded-md bg-blue-600 text-white hover:bg-blue-700 h-8 px-3 text-xs font-medium transition-colors">
+                                            ⬇️ <span class="ml-1" data-i18n="一键安装/修复内核">一键安装/修复内核</span>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div id="cloakbrowserEnvPanel" class="rounded-md border border-border bg-muted/30 p-3 text-xs space-y-1.5">
+                                    <div class="grid grid-cols-2 gap-1.5">
+                                        <div><span class="text-muted-foreground">运行载体：</span><span id="cbEnvHostBadge" class="font-medium">检测中...</span></div>
+                                        <div><span class="text-muted-foreground">Python 依赖：</span><span id="cbEnvPkgBadge" class="font-medium">检测中...</span></div>
+                                        <div><span class="text-muted-foreground">Pro 浏览器内核：</span><span id="cbEnvKernelBadge" class="font-medium">检测中...</span></div>
+                                        <div><span class="text-muted-foreground">已生效 Key：</span><span id="cbEnvKeyBadge" class="font-medium">检测中...</span></div>
+                                    </div>
+                                    <div id="cbEnvBinaryRow" class="text-[11px] text-muted-foreground break-all hidden">
+                                        <span>内核路径：</span><code id="cbEnvBinaryPath" class="font-mono"></code>
+                                    </div>
+                                    <div id="cbEnvProgressBox" class="rounded px-2.5 py-1.5 bg-background border border-border text-xs font-mono break-all text-muted-foreground">
+                                        点击「检测环境」查看当前状态，或填写 Key 后点击「一键安装/修复内核」自动下载安装。
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- 浏览器打码配置选项 -->
@@ -1152,7 +1180,7 @@
         saveCacheConfig=async()=>{const enabled=$('cfgCacheEnabled').checked,timeoutInput=$('cfgCacheTimeout').value.trim(),timeout=timeoutInput===''?7200:parseInt(timeoutInput,10),baseUrl=$('cfgCacheBaseUrl').value.trim();console.log(I18n.t("保存缓存配置:"),{enabled,timeout,baseUrl});if(Number.isNaN(timeout)||timeout<0||timeout>86400)return showToast(I18n.t("缓存超时时间必须在 0-86400 秒之间，0 表示不删除"),'error');if(baseUrl&&!baseUrl.startsWith('http://')&&!baseUrl.startsWith('https://'))return showToast(I18n.t("域名必须以 http:// 或 https:// 开头"),'error');try{console.log(I18n.t("保存缓存启用状态..."));const r0=await apiRequest('/api/cache/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r0){console.error(I18n.t("保存缓存启用状态请求失败"));return}const d0=await r0.json();console.log(I18n.t("缓存启用状态保存结果:"),d0);if(!d0.success){console.error(I18n.t("保存缓存启用状态失败:"),d0);return showToast(I18n.t("保存缓存启用状态失败"),'error')}console.log(I18n.t("保存超时时间..."));const r1=await apiRequest('/api/cache/config',{method:'POST',body:JSON.stringify({timeout:timeout})});if(!r1){console.error(I18n.t("保存超时时间请求失败"));return}const d1=await r1.json();console.log(I18n.t("超时时间保存结果:"),d1);if(!d1.success){console.error(I18n.t("保存超时时间失败:"),d1);return showToast(I18n.t("保存超时时间失败"),'error')}console.log(I18n.t("保存域名..."));const r2=await apiRequest('/api/cache/base-url',{method:'POST',body:JSON.stringify({base_url:baseUrl})});if(!r2){console.error(I18n.t("保存域名请求失败"));return}const d2=await r2.json();console.log(I18n.t("域名保存结果:"),d2);if(d2.success){showToast(I18n.t("缓存配置保存成功"),'success');console.log(I18n.t("等待配置文件写入完成..."));await new Promise(r=>setTimeout(r,200));console.log(I18n.t("重新加载配置..."));await loadCacheConfig()}else{console.error(I18n.t("保存域名失败:"),d2);showToast(I18n.t("保存域名失败"),'error')}}catch(e){console.error(I18n.t("保存失败:"),e);showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         saveGenerationTimeout=async()=>{const imageTimeout=parseInt($('cfgImageTimeout').value)||300,videoTimeout=parseInt($('cfgVideoTimeout').value)||1500,queueTimeout=$('cfgQueueTimeout')?(parseInt($('cfgQueueTimeout').value)||1800):1800,maxRetries=parseInt($('cfgMaxRetries').value)||3;console.log(I18n.t("保存生成配置:"),{imageTimeout,videoTimeout,queueTimeout,maxRetries});if(imageTimeout<60||imageTimeout>3600)return showToast(I18n.t("图片超时时间必须在 60-3600 秒之间"),'error');if(videoTimeout<60||videoTimeout>7200)return showToast(I18n.t("视频超时时间必须在 60-7200 秒之间"),'error');if(queueTimeout<30||queueTimeout>86400)return showToast("队列排队超时时间必须在 30-86400 秒之间",'error');if(maxRetries<1)return showToast(I18n.t("最大重试次数不能小于 1"),'error');try{const r=await apiRequest('/api/generation/timeout',{method:'POST',body:JSON.stringify({image_timeout:imageTimeout,video_timeout:videoTimeout,queue_timeout:queueTimeout,max_retries:maxRetries})});if(!r){console.error(I18n.t("保存请求失败"));return}const d=await r.json();console.log(I18n.t("保存结果:"),d);if(d.success){showToast(I18n.t("生成配置保存成功"),'success');await new Promise(r=>setTimeout(r,200));await loadGenerationTimeout()}else{console.error(I18n.t("保存失败:"),d);showToast(I18n.t("保存失败"),'error')}}catch(e){console.error(I18n.t("保存失败:"),e);showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         saveCallLogicConfig=async()=>{const callMode=$('cfgCallLogicMode').value||'default';try{const r=await apiRequest('/api/call-logic/config',{method:'POST',body:JSON.stringify({call_mode:callMode})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("Token轮询配置保存成功"),'success');await loadCallLogicConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){console.error(I18n.t("保存轮询模式配置失败:"),e);showToast(I18n.t("保存轮询模式配置失败: {error}", {error: (e.message)}),'error')}},
-        toggleCaptchaOptions=()=>{const method=$('cfgCaptchaMethod').value;$('yescaptchaOptions').style.display=method==='yescaptcha'?'block':'none';$('captcharunOptions').classList.toggle('hidden',method!=='captcharun');$('twocaptchaOptions').classList.toggle('hidden',method!=='twocaptcha');$('capmonsterOptions').classList.toggle('hidden',method!=='capmonster');$('ezcaptchaOptions').classList.toggle('hidden',method!=='ezcaptcha');$('capsolverOptions').classList.toggle('hidden',method!=='capsolver');$('cloakbrowserCaptchaOptions').classList.toggle('hidden',method!=='cloakbrowser');$('browserCaptchaOptions').classList.toggle('hidden',method!=='browser');$('personalOptions').classList.toggle('hidden',method!=='personal');$('remoteBrowserOptions').classList.toggle('hidden',method!=='remote_browser')},
+        toggleCaptchaOptions=()=>{const method=$('cfgCaptchaMethod').value;$('yescaptchaOptions').style.display=method==='yescaptcha'?'block':'none';$('captcharunOptions').classList.toggle('hidden',method!=='captcharun');$('twocaptchaOptions').classList.toggle('hidden',method!=='twocaptcha');$('capmonsterOptions').classList.toggle('hidden',method!=='capmonster');$('ezcaptchaOptions').classList.toggle('hidden',method!=='ezcaptcha');$('capsolverOptions').classList.toggle('hidden',method!=='capsolver');$('cloakbrowserCaptchaOptions').classList.toggle('hidden',method!=='cloakbrowser');$('browserCaptchaOptions').classList.toggle('hidden',method!=='browser');$('personalOptions').classList.toggle('hidden',method!=='personal');$('remoteBrowserOptions').classList.toggle('hidden',method!=='remote_browser');if(method==='cloakbrowser'&&typeof checkCloakbrowserEnv==='function'){checkCloakbrowserEnv({silent:true})}},
         toggleCloakbrowserProxyInput=()=>{const enabled=$('cfgCloakbrowserProxyEnabled').checked;$('cloakbrowserProxyUrlInput').classList.toggle('hidden',!enabled)},
         toggleBrowserProxyInput=()=>{const enabled=$('cfgBrowserProxyEnabled').checked;$('browserProxyUrlInput').classList.toggle('hidden',!enabled)},
         togglePersonalProxyInput=()=>{const enabled=$('cfgPersonalProxyEnabled').checked;$('personalProxyUrlInput').classList.toggle('hidden',!enabled)},
@@ -1194,7 +1222,107 @@
         showLogDetail=async(logId,opts={})=>{const silent=!!opts.silent;const modal=$('logDetailModal');const content=$('logDetailContent');window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=window.logListMeta||Object.create(null);window.logDetailRequestSeq=(window.logDetailRequestSeq||0)+1;const requestSeq=window.logDetailRequestSeq;window.activeLogDetailId=logId;modal.classList.remove('hidden');content.innerHTML="<div class=\"rounded-md border border-border p-4 bg-muted/30 text-sm text-muted-foreground\"><span data-i18n=\"日志详情加载中...\">日志详情加载中...</span></div>";try{const meta=window.logListMeta[logId];let log=window.logDetailCache[logId];if(!log||!meta||log.updated_at!==meta.updated_at){const r=await apiRequest(`/api/logs/${logId}`);if(!r)return;if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;if(r.status===404){content.innerHTML="<div class=\"rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700\"><span data-i18n=\"日志不存在或已被删除\">日志不存在或已被删除</span></div>";return}log=await r.json();window.logDetailCache[logId]=log}if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;renderLogDetail(log)}catch(e){if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;console.error(I18n.t("加载日志详情失败:"),e);content.innerHTML=`<div class="rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700"><span data-i18n="加载日志详情失败:">加载日志详情失败:</span> ${escapeLogHtml(e.message||I18n.t("未知错误"))}</div>`;if(!silent)showToast(I18n.t("加载日志详情失败: {error}", {error: (e.message)}),'error')}},
         closeLogDetailModal=()=>{window.activeLogDetailId=null;resetLogMediaCache();$('logDetailModal').classList.add('hidden')},
         stopCaptchaRuntimeStatusPolling=()=>{if(window.captchaRuntimeStatusTimer){clearInterval(window.captchaRuntimeStatusTimer);window.captchaRuntimeStatusTimer=null}},
-        pollCaptchaRuntimeStatus=async(method,opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest(`/api/captcha/runtime-status?method=${encodeURIComponent(method)}`);if(!r)return null;const d=await r.json();const state=String(d.state||'idle').trim();const message=String(d.message||'').trim();const key=`${state}:${d.sequence||0}:${message}`;const meta=window.captchaRuntimeStatusMeta||{key:'',lastToastAt:0,method:method};const now=Date.now();const shouldRepeat=message&&now-(meta.lastToastAt||0)>=5000;const shouldToast=!silent&&message&&(key!==meta.key||shouldRepeat);if(shouldToast){const toastType=state==='error'?'error':(state==='ready'?'success':'info');showToast(message,toastType,state==='ready'||state==='error'?3600:2600);meta.lastToastAt=now}meta.key=key;meta.method=method;meta.state=state;window.captchaRuntimeStatusMeta=meta;if(state==='ready'||state==='error'||(!d.active&&!d.task_running&&state!=='running'))stopCaptchaRuntimeStatusPolling();return d}catch(e){console.error(I18n.t("轮询浏览器环境状态失败:"),e);if(!silent)showToast(I18n.t("获取浏览器环境状态失败: {error}", {error: (e.message)}),'error',3200);stopCaptchaRuntimeStatusPolling();return null}},
+        renderCloakbrowserEnvStatus=data=>{
+            if(!data)return;
+            const hostEl=$('cbEnvHostBadge'),pkgEl=$('cbEnvPkgBadge'),kernelEl=$('cbEnvKernelBadge'),keyEl=$('cbEnvKeyBadge'),binRow=$('cbEnvBinaryRow'),binPath=$('cbEnvBinaryPath'),progBox=$('cbEnvProgressBox'),installBtn=$('btnInstallCloakbrowser');
+            if(hostEl){
+                hostEl.textContent=data.in_docker?`Docker 容器 (Linux ${data.display||'Xvfb'})`:'本地宿主机';
+                hostEl.className='font-medium text-blue-600';
+            }
+            if(pkgEl){
+                pkgEl.textContent=data.pkg_installed?`✅ 已安装 (${data.pkg_version||'ok'})`:'❌ 未安装';
+                pkgEl.className=`font-medium ${data.pkg_installed?'text-green-600':'text-red-600'}`;
+            }
+            if(kernelEl){
+                kernelEl.textContent=data.kernel_installed?`✅ 已就绪 (${data.kernel_version||'Pro'})`:'❌ 未安装内核';
+                kernelEl.className=`font-medium ${data.kernel_installed?'text-green-600':'text-red-600'}`;
+            }
+            if(keyEl){
+                const cnt=Number(data.keys_count||0);
+                keyEl.textContent=cnt>0?`✅ 已配置 ${cnt} 个 (${(data.masked_keys||[]).join(', ')})`:'⚠️ 未配置 Key';
+                keyEl.className=`font-medium ${cnt>0?'text-green-600':'text-amber-600'}`;
+            }
+            if(binRow&&binPath){
+                if(data.binary_path){
+                    binRow.classList.remove('hidden');
+                    binPath.textContent=data.binary_path;
+                }else{
+                    binRow.classList.add('hidden');
+                }
+            }
+            const rt=data.runtime_status||{};
+            const rtState=String(rt.state||'idle');
+            const isRunning=!!data.task_running||rtState==='running';
+            if(installBtn){
+                installBtn.disabled=isRunning;
+                installBtn.innerHTML=isRunning?'⏳ <span class="ml-1">正在安装内核中...</span>':(data.kernel_installed?'🔄 <span class="ml-1">重新检测/修复内核</span>':'⬇️ <span class="ml-1">一键安装/修复内核</span>');
+            }
+            if(progBox){
+                let msg=String(rt.message||'').trim();
+                if(!msg){
+                    if(data.ready){
+                        msg='✅ CloakBrowser Pro 内核与授权 Key 均已就绪，可直接开始打码。';
+                    }else if(!data.kernel_installed){
+                        msg='❌ 当前尚未安装 CloakBrowser Pro 浏览器内核，请确认上方填写 cb_ 密钥后点击「一键安装/修复内核」。';
+                    }else if(!data.keys_count){
+                        msg='⚠️ 内核已安装，但尚未填写有效的 cb_ 开头 License Key。';
+                    }
+                }
+                progBox.textContent=msg;
+                progBox.className=`rounded px-2.5 py-1.5 border text-xs font-mono break-all ${rtState==='error'||(!isRunning&&!data.kernel_installed)?'bg-red-50 border-red-200 text-red-700':(isRunning?'bg-amber-50 border-amber-200 text-amber-800':(data.ready||rtState==='ready'?'bg-green-50 border-green-200 text-green-700':'bg-background border-border text-muted-foreground'))}`;
+            }
+        },
+        checkCloakbrowserEnv=async(opts={})=>{
+            const silent=!!opts.silent;
+            const checkBtn=$('btnCheckCloakbrowser');
+            if(checkBtn&&!silent)checkBtn.disabled=true;
+            try{
+                const r=await apiRequest('/api/captcha/cloakbrowser/status');
+                if(!r)return null;
+                const d=await r.json();
+                renderCloakbrowserEnvStatus(d);
+                if(!silent){
+                    if(d.ready){
+                        showToast('✅ CloakBrowser Pro 环境与内核已就绪','success');
+                    }else if(d.task_running){
+                        showToast('⏳ CloakBrowser 内核正在后台安装中...','info');
+                    }else{
+                        showToast('⚠️ 检测到 CloakBrowser 内核或 Key 未就绪，请点击「一键安装/修复内核」','error',3200);
+                    }
+                }
+                if(d.task_running&&!window.captchaRuntimeStatusTimer){
+                    startCaptchaRuntimeStatusPolling('cloakbrowser');
+                }
+                return d;
+            }catch(e){
+                if(!silent)showToast(`检测环境失败: ${e.message}`,'error');
+                return null;
+            }finally{
+                if(checkBtn&&!silent)checkBtn.disabled=false;
+            }
+        },
+        installCloakbrowserKernel=async()=>{
+            const keyVal=($('cfgCloakbrowserApiKey')?$('cfgCloakbrowserApiKey').value:'').trim();
+            const installBtn=$('btnInstallCloakbrowser');
+            if(installBtn)installBtn.disabled=true;
+            try{
+                const r=await apiRequest('/api/captcha/cloakbrowser/install',{method:'POST',body:JSON.stringify({cloakbrowser_api_key:keyVal})});
+                if(!r)return;
+                const d=await r.json();
+                renderCloakbrowserEnvStatus(d);
+                if(d.success){
+                    showToast(d.message||'已启动 CloakBrowser Pro 内核安装任务','info',3200);
+                    startCaptchaRuntimeStatusPolling('cloakbrowser',d.message||'');
+                }else{
+                    showToast(d.message||'启动安装失败','error',3500);
+                    if(installBtn)installBtn.disabled=false;
+                }
+            }catch(e){
+                showToast(`安装请求失败: ${e.message}`,'error');
+                if(installBtn)installBtn.disabled=false;
+            }
+        },
+        pollCaptchaRuntimeStatus=async(method,opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest(`/api/captcha/runtime-status?method=${encodeURIComponent(method)}`);if(!r)return null;const d=await r.json();if(method==='cloakbrowser'){checkCloakbrowserEnv({silent:true})}const state=String(d.state||'idle').trim();const message=String(d.message||'').trim();const key=`${state}:${d.sequence||0}:${message}`;const meta=window.captchaRuntimeStatusMeta||{key:'',lastToastAt:0,method:method};const now=Date.now();const shouldRepeat=message&&now-(meta.lastToastAt||0)>=5000;const shouldToast=!silent&&message&&(key!==meta.key||shouldRepeat);if(shouldToast){const toastType=state==='error'?'error':(state==='ready'?'success':'info');showToast(message,toastType,state==='ready'||state==='error'?3600:2600);meta.lastToastAt=now}meta.key=key;meta.method=method;meta.state=state;window.captchaRuntimeStatusMeta=meta;if(state==='ready'||state==='error'||(!d.active&&!d.task_running&&state!=='running')){stopCaptchaRuntimeStatusPolling();if(method==='cloakbrowser')checkCloakbrowserEnv({silent:true})}return d}catch(e){console.error(I18n.t("轮询浏览器环境状态失败:"),e);if(!silent)showToast(I18n.t("获取浏览器环境状态失败: {error}", {error: (e.message)}),'error',3200);stopCaptchaRuntimeStatusPolling();return null}},
         startCaptchaRuntimeStatusPolling=(method,initialMessage='')=>{stopCaptchaRuntimeStatusPolling();window.captchaRuntimeStatusMeta={key:'',lastToastAt:0,method:method,state:'running'};if(initialMessage)showToast(initialMessage,'info',2800);pollCaptchaRuntimeStatus(method,{silent:true});window.captchaRuntimeStatusTimer=setInterval(()=>{pollCaptchaRuntimeStatus(method)},3000)},
         resumeCaptchaRuntimeStatusPollingIfNeeded=async(method)=>{if(method!=='browser'&&method!=='cloakbrowser'&&method!=='personal')return;const status=await pollCaptchaRuntimeStatus(method,{silent:true});if(status&&(status.active||status.task_running||status.state==='running'))startCaptchaRuntimeStatusPolling(method)},
         showToast=(m,t='info',duration=2000)=>{const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.info} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;I18n.setMessage(d, m);document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},duration)},
@@ -1641,7 +1769,7 @@
             if(window.lastQueueSnapshot) renderQueueTasks(window.lastQueueSnapshot);
             renderProxyTestResult();
         });
-        Object.assign(window, {$, apiRequest, loadStats, loadTokens, formatExpiry, formatPlanType, formatSora2, formatPlanTypeWithTooltip, formatSora2Remaining, formatAccountType, formatProjectNameDisplay, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copySora2Code, copyProjectId, openSora2Modal, closeSora2Modal, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, submitSora2Activate, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleCloakbrowserProxyInput, toggleBrowserProxyInput, togglePersonalProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, stopQueueAutoRefresh, startQueueAutoRefresh, renderQueueTasks, loadQueueTasks, cancelQueueTask, cancelAllQueuedTasks, clearQueueHistory, switchTab, escapeLogHtml, parseLogJson, truncateLogText, extractLogErrorSummary, extractLogPrimaryUrl, extractLogSuccessSummary, formatLogPayload, resetLogMediaCache, getLogDetailToggleState, setLogDetailToggleState, syncLogDetailViewState, cacheLogMediaUrl, normalizeLogMediaUrl, renderLogLink, isVideoUrl, isImageUrl, renderMediaPreview, handleLogMediaPreviewError, loadLogMediaPreview, renderLogDetail});
+        Object.assign(window, {$, apiRequest, loadStats, loadTokens, formatExpiry, formatPlanType, formatSora2, formatPlanTypeWithTooltip, formatSora2Remaining, formatAccountType, formatProjectNameDisplay, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copySora2Code, copyProjectId, openSora2Modal, closeSora2Modal, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, submitSora2Activate, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleCloakbrowserProxyInput, toggleBrowserProxyInput, togglePersonalProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, renderCloakbrowserEnvStatus, checkCloakbrowserEnv, installCloakbrowserKernel, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, stopQueueAutoRefresh, startQueueAutoRefresh, renderQueueTasks, loadQueueTasks, cancelQueueTask, cancelAllQueuedTasks, clearQueueHistory, switchTab, escapeLogHtml, parseLogJson, truncateLogText, extractLogErrorSummary, extractLogPrimaryUrl, extractLogSuccessSummary, formatLogPayload, resetLogMediaCache, getLogDetailToggleState, setLogDetailToggleState, syncLogDetailViewState, cacheLogMediaUrl, normalizeLogMediaUrl, renderLogLink, isVideoUrl, isImageUrl, renderMediaPreview, handleLogMediaPreviewError, loadLogMediaPreview, renderLogDetail});
     });
     </script>
 </body>

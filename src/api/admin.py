@@ -1,11 +1,12 @@
 """
 核心职责：Flow2API 管理后台 API 路由层。
-主要功能：提供管理员认证、Token 增删改查与刷新、代理测试、验证码配置（含 CloakBrowser 多 Key 管理）、运行状态监控及分数测试接口。
+主要功能：提供管理员认证、Token 增删改查与刷新、代理测试、验证码配置（含 CloakBrowser 环境检测、一键安装与多 Key 管理）、运行状态监控及分数测试接口。
 """
 
 import asyncio
 import hashlib
 import importlib
+import os
 import sys
 import json
 from datetime import datetime, timezone
@@ -214,31 +215,48 @@ def _normalize_runtime_method(method: Optional[str]) -> str:
     return normalized
 
 
-async def _prepare_captcha_runtime(method: str):
+async def _prepare_captcha_runtime(method: str, force_install: bool = False):
     runtime_method = _normalize_runtime_method(method)
     try:
         if runtime_method == "cloakbrowser":
             start_runtime_prepare(
                 runtime_method,
-                "正在检查 CloakBrowser 打码运行环境与授权...",
+                "正在检测 CloakBrowser 打码运行环境、依赖包与 Pro 内核...",
             )
             from ..services.browser_captcha import (
                 _resolve_cloakbrowser_executable,
                 _resolve_cloakbrowser_license_keys,
+                install_cloakbrowser_runtime,
             )
-            cb_exe = _resolve_cloakbrowser_executable()
-            if not cb_exe or not os.path.exists(cb_exe):
-                err = (
-                    "未检测到 CloakBrowser Pro 内核文件！"
-                    "请运行 python setup_cloakbrowser.py 安装内核，或在设置中更换其他打码方式。"
-                )
-                fail_runtime_prepare(runtime_method, err)
-                raise RuntimeError(err)
+
             cb_keys = _resolve_cloakbrowser_license_keys()
             if not cb_keys:
                 err = (
                     "未配置 CloakBrowser License Key！"
-                    "请在管理后台「打码配置」输入授权码，或在设置中更换其他打码方式。"
+                    "请在上方输入框填写 cb_ 开头的授权码并保存（或点击一键安装）。"
+                )
+                fail_runtime_prepare(runtime_method, err)
+                raise RuntimeError(err)
+
+            cb_exe = _resolve_cloakbrowser_executable()
+            if force_install or not cb_exe or not os.path.exists(cb_exe):
+                progress_runtime_prepare(
+                    runtime_method,
+                    "未检测到已安装的 CloakBrowser Pro 内核，开始自动下载安装（约 500MB）...",
+                )
+                install_res = await asyncio.to_thread(
+                    install_cloakbrowser_runtime, cb_keys[0]
+                )
+                if not install_res.get("success"):
+                    err = install_res.get("message") or "CloakBrowser Pro 内核自动安装失败"
+                    fail_runtime_prepare(runtime_method, err)
+                    raise RuntimeError(err)
+                cb_exe = _resolve_cloakbrowser_executable()
+
+            if not cb_exe or not os.path.exists(cb_exe):
+                err = (
+                    "未检测到 CloakBrowser Pro 内核文件！"
+                    "请点击「一键安装/修复内核」按钮进行安装，或更换其他打码方式。"
                 )
                 fail_runtime_prepare(runtime_method, err)
                 raise RuntimeError(err)
@@ -265,7 +283,7 @@ async def _prepare_captcha_runtime(method: str):
                 await service.warmup_browser_slots()
             finish_runtime_prepare(
                 runtime_method,
-                "CloakBrowser 浏览器环境已就绪，可以开始使用 CloakBrowser 打码。"
+                "CloakBrowser Pro 浏览器环境与授权已就绪，可以开始使用 CloakBrowser 打码。"
                 if runtime_method == "cloakbrowser"
                 else "Chromium 浏览器环境已就绪，可以开始使用有头浏览器打码。",
             )
@@ -290,17 +308,17 @@ async def _prepare_captcha_runtime(method: str):
         captcha_runtime_prepare_tasks.pop(runtime_method, None)
 
 
-def _schedule_captcha_runtime_prepare(method: str) -> bool:
+def _schedule_captcha_runtime_prepare(method: str, force_install: bool = False) -> bool:
     runtime_method = _normalize_runtime_method(method)
     task = captcha_runtime_prepare_tasks.get(runtime_method)
     if task and not task.done():
         progress_runtime_prepare(
-            runtime_method, "浏览器环境准备任务仍在进行中，请稍候..."
+            runtime_method, "浏览器环境准备/安装任务仍在进行中，请稍候..."
         )
         return False
 
     captcha_runtime_prepare_tasks[runtime_method] = asyncio.create_task(
-        _prepare_captcha_runtime(runtime_method)
+        _prepare_captcha_runtime(runtime_method, force_install=force_install)
     )
     return True
 
@@ -2244,6 +2262,94 @@ async def get_captcha_runtime_status(
     status["method"] = runtime_method
     status["task_running"] = bool(task and not task.done())
     return status
+
+
+@router.get("/api/captcha/cloakbrowser/status")
+async def get_cloakbrowser_status_endpoint(
+    token: str = Depends(verify_admin_token),
+):
+    """检测当前 CloakBrowser 依赖包、Pro 浏览器内核、授权 Key 与运行状态。"""
+    from ..services.browser_captcha import get_cloakbrowser_env_status
+
+    status = await asyncio.to_thread(get_cloakbrowser_env_status)
+    task = captcha_runtime_prepare_tasks.get("cloakbrowser")
+    status["task_running"] = bool(task and not task.done())
+    return status
+
+
+@router.post("/api/captcha/cloakbrowser/install")
+async def install_cloakbrowser_endpoint(
+    request: Request,
+    token: str = Depends(verify_admin_token),
+):
+    """一键检测并后台安装/修复 CloakBrowser Pro 浏览器内核（支持传入当前输入框中的 License Key）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    input_key = str((body or {}).get("cloakbrowser_api_key") or "").strip()
+    if input_key:
+        current_cfg = await db.get_captcha_config()
+        await db.update_captcha_config(
+            captcha_method=current_cfg.captcha_method,
+            yescaptcha_api_key=current_cfg.yescaptcha_api_key,
+            yescaptcha_base_url=current_cfg.yescaptcha_base_url,
+            yescaptcha_task_type=current_cfg.yescaptcha_task_type,
+            capmonster_api_key=current_cfg.capmonster_api_key,
+            capmonster_base_url=current_cfg.capmonster_base_url,
+            ezcaptcha_api_key=current_cfg.ezcaptcha_api_key,
+            ezcaptcha_base_url=current_cfg.ezcaptcha_base_url,
+            capsolver_api_key=current_cfg.capsolver_api_key,
+            capsolver_base_url=current_cfg.capsolver_base_url,
+            captcharun_api_key=current_cfg.captcharun_api_key,
+            captcharun_base_url=current_cfg.captcharun_base_url,
+            twocaptcha_api_key=current_cfg.twocaptcha_api_key,
+            twocaptcha_base_url=current_cfg.twocaptcha_base_url,
+            cloakbrowser_api_key=input_key,
+            remote_browser_base_url=current_cfg.remote_browser_base_url,
+            remote_browser_api_key=current_cfg.remote_browser_api_key,
+            remote_browser_timeout=current_cfg.remote_browser_timeout,
+            browser_proxy_enabled=current_cfg.browser_proxy_enabled,
+            browser_proxy_url=current_cfg.browser_proxy_url,
+            browser_count=current_cfg.browser_count,
+            browser_launch_background=bool(
+                getattr(current_cfg, "browser_launch_background", True)
+            ),
+            personal_project_pool_size=current_cfg.personal_project_pool_size,
+            personal_max_resident_tabs=current_cfg.personal_max_resident_tabs,
+            browser_personal_fresh_restart_every_n_solves=current_cfg.browser_personal_fresh_restart_every_n_solves,
+            personal_idle_tab_ttl_seconds=current_cfg.personal_idle_tab_ttl_seconds,
+        )
+        await db.reload_config_to_memory()
+
+    from ..services.browser_captcha import (
+        _resolve_cloakbrowser_license_keys,
+        get_cloakbrowser_env_status,
+    )
+
+    keys = _resolve_cloakbrowser_license_keys()
+    if not keys:
+        return {
+            "success": False,
+            "message": "请先在上方填写 cb_ 开头的 CloakBrowser License Key 后再点击安装内核！",
+            **(await asyncio.to_thread(get_cloakbrowser_env_status)),
+        }
+
+    started = _schedule_captcha_runtime_prepare("cloakbrowser", force_install=True)
+    status = await asyncio.to_thread(get_cloakbrowser_env_status)
+    task = captcha_runtime_prepare_tasks.get("cloakbrowser")
+    status["task_running"] = bool(task and not task.done())
+    return {
+        "success": True,
+        "started": started,
+        "message": (
+            "已启动 CloakBrowser Pro 内核安装与环境准备任务（约 500MB），下方将实时显示进度..."
+            if started
+            else "安装任务已在后台运行中，请稍候..."
+        ),
+        **status,
+    }
 
 
 @router.get("/api/captcha/config")

@@ -1,7 +1,7 @@
 """
 核心职责：基于 Playwright 的本地有头浏览器 reCAPTCHA 打码与常驻会话管理服务。
 主要功能：
-1. 管理 Token 级/共享级有头浏览器实例（优先自动发现并集成 CloakBrowser Pro 内核与授权 Key）；
+1. 管理 Token 级/共享级有头浏览器实例（支持 CloakBrowser Pro 内核环境检测、一键安装与授权 Key 管理）；
 2. 执行 Flow 页面预热、环境指纹对齐与 trusted reCAPTCHA / UI harvest 取码；
 3. 支持自动刷新 Session Token、代理注入与异常自愈重试。
 """
@@ -10,6 +10,8 @@ import os
 import sys
 import subprocess
 import signal
+import importlib
+from pathlib import Path
 
 # 修复 Windows 上 playwright 的 asyncio 兼容性问题
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
@@ -32,6 +34,7 @@ from ..core.logger import debug_logger
 from ..core.browser_runtime_status import (
     fail_runtime_prepare,
     finish_runtime_prepare,
+    get_runtime_status,
     progress_runtime_prepare,
 )
 from ..core.config import config
@@ -258,18 +261,171 @@ def _resolve_cloakbrowser_executable() -> Optional[str]:
     return None
 
 
+def get_cloakbrowser_env_status() -> Dict[str, Any]:
+    """获取当前运行环境中 CloakBrowser 依赖包、Pro 浏览器内核及授权 Key 的完整检测状态。"""
+    pkg_installed = False
+    pkg_version = ""
+    kernel_installed = False
+    kernel_version = ""
+    binary_path = ""
+    cache_dir = ""
+
+    try:
+        import cloakbrowser
+        from cloakbrowser.config import get_binary_path, get_cache_dir, get_effective_version
+
+        pkg_installed = True
+        pkg_version = str(getattr(cloakbrowser, "__version__", "") or "installed")
+        try:
+            cache_dir = str(get_cache_dir())
+        except Exception:
+            pass
+        eff_ver = get_effective_version()
+        if eff_ver:
+            kernel_version = str(eff_ver)
+            bp = get_binary_path(eff_ver)
+            if bp and bp.exists():
+                kernel_installed = True
+                binary_path = str(bp)
+    except ImportError:
+        pass
+    except Exception as e:
+        debug_logger.log_warning(f"[BrowserCaptcha] 检测 CloakBrowser 环境状态异常: {e}")
+
+    keys = _resolve_cloakbrowser_license_keys()
+    masked_keys = [_mask_cloakbrowser_key(k) for k in keys]
+    rt_status = get_runtime_status("cloakbrowser")
+
+    return {
+        "pkg_installed": pkg_installed,
+        "pkg_version": pkg_version,
+        "kernel_installed": kernel_installed,
+        "kernel_version": kernel_version,
+        "binary_path": binary_path,
+        "cache_dir": cache_dir,
+        "keys_count": len(keys),
+        "masked_keys": masked_keys,
+        "in_docker": IS_DOCKER,
+        "display": os.environ.get("DISPLAY", ""),
+        "ready": bool(pkg_installed and kernel_installed and len(keys) > 0),
+        "runtime_status": rt_status,
+    }
+
+
+def install_cloakbrowser_runtime(api_key: Optional[str] = None) -> Dict[str, Any]:
+    """同步安装/修复 CloakBrowser Python 包与 Pro 浏览器内核，并实时更新 runtime_status。"""
+    keys = []
+    if api_key and str(api_key).strip():
+        keys = [
+            part.strip()
+            for part in str(api_key).replace(",", "\n").splitlines()
+            if part.strip()
+        ]
+    if not keys:
+        keys = _resolve_cloakbrowser_license_keys()
+
+    if not keys:
+        err_msg = "安装 CloakBrowser Pro 内核需要先填写有效的 cb_ 开头 License Key！"
+        fail_runtime_prepare("cloakbrowser", err_msg)
+        return {"success": False, "message": err_msg, **get_cloakbrowser_env_status()}
+
+    primary_key = keys[0]
+    os.environ["CLOAKBROWSER_LICENSE_KEY"] = primary_key
+
+    # 1. 确保 cloakbrowser Python 依赖包已安装
+    try:
+        import cloakbrowser  # noqa: F401
+    except ImportError:
+        progress_runtime_prepare("cloakbrowser", "正在安装 cloakbrowser Python 依赖包...")
+        installed_pkg = False
+        for use_mirror in (False, True):
+            cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "cloakbrowser"]
+            if use_mirror:
+                cmd.extend(["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"])
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if res.returncode == 0:
+                installed_pkg = True
+                importlib.invalidate_caches()
+                break
+        if not installed_pkg:
+            err_msg = "cloakbrowser Python 依赖包安装失败，请检查容器/本机网络连接。"
+            fail_runtime_prepare("cloakbrowser", err_msg)
+            return {"success": False, "message": err_msg, **get_cloakbrowser_env_status()}
+
+    # 2. 执行 setup_cloakbrowser.py 应用补丁并下载内核
+    setup_script = Path(__file__).resolve().parents[2] / "setup_cloakbrowser.py"
+    if not setup_script.exists():
+        err_msg = f"未找到安装脚本: {setup_script}"
+        fail_runtime_prepare("cloakbrowser", err_msg)
+        return {"success": False, "message": err_msg, **get_cloakbrowser_env_status()}
+
+    progress_runtime_prepare(
+        "cloakbrowser",
+        f"正在使用 Key ({_mask_cloakbrowser_key(primary_key)}) 下载并校验 CloakBrowser Pro 内核（约 500MB，请稍候）...",
+    )
+
+    env = os.environ.copy()
+    env["CLOAKBROWSER_LICENSE_KEY"] = primary_key
+    env["PYTHONUNBUFFERED"] = "1"
+    if getattr(config, "browser_proxy_enabled", False) and getattr(config, "browser_proxy_url", ""):
+        proxy_url = str(config.browser_proxy_url).strip()
+        if proxy_url:
+            env["HTTP_PROXY"] = proxy_url
+            env["HTTPS_PROXY"] = proxy_url
+
+    cmd = [sys.executable, "-u", str(setup_script), "--key", primary_key]
+    last_lines: List[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            last_lines.append(line)
+            if len(last_lines) > 15:
+                last_lines.pop(0)
+            debug_logger.log_info(f"[CloakBrowserInstall] {line}")
+            progress_runtime_prepare("cloakbrowser", line)
+        ret_code = proc.wait(timeout=900)
+    except Exception as e:
+        err_msg = f"CloakBrowser Pro 内核安装过程异常: {e}"
+        fail_runtime_prepare("cloakbrowser", err_msg)
+        return {"success": False, "message": err_msg, **get_cloakbrowser_env_status()}
+
+    importlib.invalidate_caches()
+    cb_exe = _resolve_cloakbrowser_executable()
+    if ret_code == 0 and cb_exe and os.path.exists(cb_exe):
+        ok_msg = f"CloakBrowser Pro 内核安装就绪: {cb_exe}"
+        finish_runtime_prepare("cloakbrowser", ok_msg)
+        return {"success": True, "message": ok_msg, **get_cloakbrowser_env_status()}
+
+    tail = " | ".join(last_lines[-3:]) if last_lines else f"exit code {ret_code}"
+    err_msg = f"CloakBrowser Pro 内核安装失败: {tail}"
+    fail_runtime_prepare("cloakbrowser", err_msg)
+    return {"success": False, "message": err_msg, **get_cloakbrowser_env_status()}
+
+
 def _ensure_browser_installed() -> bool:
     """确保浏览器已安装。
 
     若打码方式为 cloakbrowser，则严格要求 CloakBrowser Pro 内核及 License Key 必须存在，
-    绝不降级或回退为普通 Chromium；缺失时直接抛出异常，提示用户更换打码方式。
+    绝不降级或回退为普通 Chromium；缺失时直接抛出异常，提示用户一键安装或更换打码方式。
     """
     if config.captcha_method == "cloakbrowser":
         cb_executable = _resolve_cloakbrowser_executable()
         if not cb_executable or not os.path.exists(cb_executable):
             err_msg = (
                 "当前打码方式为 [cloakbrowser]，但未检测到 CloakBrowser Pro 内核文件！"
-                "请运行 python setup_cloakbrowser.py 安装内核，或在管理端更换其他打码方式（如 browser / 2captcha 等）。"
+                "请在管理后台「验证码配置 -> CloakBrowser打码」中点击「一键安装/修复内核」，或更换其他打码方式。"
             )
             debug_logger.log_error(f"[BrowserCaptcha] ❌ {err_msg}")
             fail_runtime_prepare("cloakbrowser", err_msg)
