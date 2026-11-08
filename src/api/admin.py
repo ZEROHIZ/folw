@@ -220,8 +220,28 @@ async def _prepare_captcha_runtime(method: str):
         if runtime_method == "cloakbrowser":
             start_runtime_prepare(
                 runtime_method,
-                "已开始准备 CloakBrowser 打码运行环境，安装进度将自动显示。",
+                "正在检查 CloakBrowser 打码运行环境与授权...",
             )
+            from ..services.browser_captcha import (
+                _resolve_cloakbrowser_executable,
+                _resolve_cloakbrowser_license_keys,
+            )
+            cb_exe = _resolve_cloakbrowser_executable()
+            if not cb_exe or not os.path.exists(cb_exe):
+                err = (
+                    "未检测到 CloakBrowser Pro 内核文件！"
+                    "请运行 python setup_cloakbrowser.py 安装内核，或在设置中更换其他打码方式。"
+                )
+                fail_runtime_prepare(runtime_method, err)
+                raise RuntimeError(err)
+            cb_keys = _resolve_cloakbrowser_license_keys()
+            if not cb_keys:
+                err = (
+                    "未配置 CloakBrowser License Key！"
+                    "请在管理后台「打码配置」输入授权码，或在设置中更换其他打码方式。"
+                )
+                fail_runtime_prepare(runtime_method, err)
+                raise RuntimeError(err)
         elif runtime_method == "browser":
             start_runtime_prepare(
                 runtime_method,

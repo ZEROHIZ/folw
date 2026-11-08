@@ -1,4 +1,4 @@
-﻿<#
+<#
 核心职责：Flow2API 新环境一键初始化与重装脚本（Windows PowerShell）。
 主要功能：
 1. 自动创建 Python 虚拟环境 (venv) 并升级 pip；

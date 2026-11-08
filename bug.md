@@ -66,6 +66,16 @@
   2. 将 [`BrowserCaptchaService.QUEUE_WAIT_SECONDS`](src/services/browser_captcha.py) 提升至 `600.0` 秒（并动态取 `max(600.0, image_timeout * 2)`）。
   3. 在 [`src/api/admin.py`](src/api/admin.py) 与 [`static/manage.html`](static/manage.html) 中新增「队列任务」标签页与取消接口（`GET /api/queue/tasks`、`POST /api/queue/{task_id}/cancel`、`POST /api/queue/cancel-all`）。
 
+## 2026-11-09：移除 CloakBrowser 静默回退，内核与授权缺失时直接显式报错阻断
+
+- **现象**：
+  - 当打码方式显式配置为 `cloakbrowser` 时，若服务器/容器内未安装 CloakBrowser Pro 内核或未配置 License Key，系统原先会静默降级回退到 Playwright 普通 Chromium。这会导致用户误以为自己在用高强度防指纹浏览器，但实际上使用的是极易被风控检测的普通 Chromium。
+- **根因**：
+  - [`src/services/browser_captcha.py`](src/services/browser_captcha.py) 的 `_ensure_browser_installed()` 在探测不到 `_resolve_cloakbrowser_executable()` 时，自动向下走到了普通 Chromium 探测及自动下载逻辑；`TokenBrowser._create_browser()` 在 executable 为空时直接回退传给 Playwright 启动默认浏览器。
+- **修复方案**：
+  1. 在 [`src/services/browser_captcha.py`](src/services/browser_captcha.py) 的 `_ensure_browser_installed()` 与 `TokenBrowser._create_browser()` 中增加严格校验：当 `config.captcha_method == "cloakbrowser"` 时，若 Pro 内核文件不存在或未配置 License Key，立即抛出明确异常（`RuntimeError: 当前打码方式为 [cloakbrowser]，但未检测到 CloakBrowser Pro 内核文件 / 未配置 License Key`），绝不静默回退。
+  2. 在 [`src/api/admin.py`](src/api/admin.py) 的 `_prepare_captcha_runtime()` 中增加前置检查，避免用户误配置后进入无意义的等待，直接提示用户在管理端更换打码方式或安装内核。
+
 ## 2026-11-08：合并上游主分支功能（Omni 1.2 Flash 与 账号配额耗尽/风控无感换号重试）
 
 - **背景与需求**：

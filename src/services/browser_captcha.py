@@ -259,7 +259,40 @@ def _resolve_cloakbrowser_executable() -> Optional[str]:
 
 
 def _ensure_browser_installed() -> bool:
-    """确保 chromium 浏览器已安装"""
+    """确保浏览器已安装。
+
+    若打码方式为 cloakbrowser，则严格要求 CloakBrowser Pro 内核及 License Key 必须存在，
+    绝不降级或回退为普通 Chromium；缺失时直接抛出异常，提示用户更换打码方式。
+    """
+    if config.captcha_method == "cloakbrowser":
+        cb_executable = _resolve_cloakbrowser_executable()
+        if not cb_executable or not os.path.exists(cb_executable):
+            err_msg = (
+                "当前打码方式为 [cloakbrowser]，但未检测到 CloakBrowser Pro 内核文件！"
+                "请运行 python setup_cloakbrowser.py 安装内核，或在管理端更换其他打码方式（如 browser / 2captcha 等）。"
+            )
+            debug_logger.log_error(f"[BrowserCaptcha] ❌ {err_msg}")
+            fail_runtime_prepare("cloakbrowser", err_msg)
+            raise RuntimeError(err_msg)
+
+        keys = _resolve_cloakbrowser_license_keys()
+        if not keys:
+            err_msg = (
+                "当前打码方式为 [cloakbrowser]，但未配置任何 License Key！"
+                "请在管理后台「打码配置」输入授权码，或在环境变量设置 CLOAKBROWSER_LICENSE_KEY，或更换其他打码方式。"
+            )
+            debug_logger.log_error(f"[BrowserCaptcha] ❌ {err_msg}")
+            fail_runtime_prepare("cloakbrowser", err_msg)
+            raise RuntimeError(err_msg)
+
+        debug_logger.log_info(
+            f"[BrowserCaptcha] CloakBrowser Pro 浏览器与授权已就绪: {cb_executable} (共 {len(keys)} 个 Key)"
+        )
+        finish_runtime_prepare(
+            "cloakbrowser", "CloakBrowser Pro 浏览器与授权已就绪，正在准备实例..."
+        )
+        return True
+
     custom_executable = (
         os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
         or _resolve_cloakbrowser_executable()
@@ -270,7 +303,7 @@ def _ensure_browser_installed() -> bool:
             f"[BrowserCaptcha] 检测到已配置的自定义/CloakBrowser 浏览器: {custom_executable}"
         )
         finish_runtime_prepare(
-            "browser", "检测到 CloakBrowser 浏览器已安装，正在准备实例..."
+            "browser", "检测到自定义浏览器已安装，正在准备实例..."
         )
         return True
 
@@ -1674,14 +1707,31 @@ class TokenBrowser:
         if manage_slot_pid:
             await self._cleanup_stale_slot_process()
         playwright = await async_playwright().start()
-        browser_executable_path = (
-            os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
-            or _resolve_cloakbrowser_executable()
-            or None
-        )
-        is_cloakbrowser = bool(
-            browser_executable_path and "cloakbrowser" in browser_executable_path.lower()
-        )
+
+        is_mode_cloakbrowser = (getattr(config, "captcha_method", "") == "cloakbrowser")
+        if is_mode_cloakbrowser:
+            browser_executable_path = _resolve_cloakbrowser_executable()
+            if not browser_executable_path or not os.path.exists(browser_executable_path):
+                raise RuntimeError(
+                    "当前打码方式为 [cloakbrowser]，但未找到 CloakBrowser Pro 内核文件！"
+                    "请先在环境内安装内核（执行 python setup_cloakbrowser.py），或在管理端更换其他打码方式。"
+                )
+            keys = _resolve_cloakbrowser_license_keys()
+            if not keys:
+                raise RuntimeError(
+                    "当前打码方式为 [cloakbrowser]，但未配置任何 License Key！"
+                    "请在管理后台「打码配置」输入授权码，或更换其他打码方式。"
+                )
+            is_cloakbrowser = True
+        else:
+            browser_executable_path = (
+                os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
+                or _resolve_cloakbrowser_executable()
+                or None
+            )
+            is_cloakbrowser = bool(
+                browser_executable_path and "cloakbrowser" in browser_executable_path.lower()
+            )
         proxy_option, raw_proxy_url, _ = await self._resolve_proxy_runtime_config(
             token_proxy_url=token_proxy_url
         )
