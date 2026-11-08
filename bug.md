@@ -132,27 +132,17 @@
      - 移除 `_get_or_create_shared_browser` 中因 `token_binding_changed` 销毁重启整个浏览器进程的逻辑（直接复用同一个常驻 CloakBrowser 实例并在 context 内切换账号 Cookie）；
      - 在 CloakBrowser 模式下禁用冗余的 JS 原型链指纹注入补丁（`_apply_browser_environment_patch`）并启用 `no_viewport=True`，保持 C++ 原生防检测指纹纯净；
      - 在 `_create_browser` 中识别 `exitCode=76/77/78`，支持多 Key 自动轮换重试与中文明确报错，并在环境检测接口中返回实时云端并发槽位占用（`seats_active / seats_limit`）。
+  6. **优化 CloakBrowser 首次打码即高分通过（消除前 2 次冷启动低分 500 重试）**（[`src/services/browser_captcha.py`](src/services/browser_captcha.py)）：
+     - **现象**：首次生成图片时，第 1、2 次提交 `ogiZ0b` 在 ~440ms 内快速返回 `HTTP 500 Internal Error`（reCAPTCHA 分数不足被网关拦截），第 3 次重试才成功（24.2s 生成出图）。
+     - **根因**：
+       1. `_execute_captcha` 每次都新建临时标签页（`context.new_page()`），仅停留 6s 即调用 `grecaptcha.enterprise.execute()` 并在 `finally` 中立刻 `await page.close()` 关闭标签页，导致第 1 次取码处于无 `_GRECAPTCHA` 信任 Cookie、无页面驻留历史的冷启动状态；
+       2. `_execute_captcha` 与 `_execute_custom_captcha` 无条件注入了 `Object.defineProperty(navigator, 'webdriver', {get: () => undefined})`，破坏了 CloakBrowser Pro 在 C++ 层原生设置的 `Navigator.prototype.webdriver === false` 属性特征；
+       3. `_ensure_shared_token_binding` 调用 `context.clear_cookies()` 时未保留已生成的 `_GRECAPTCHA` 等风控信任 Cookie。
+     - **修复方案**：
+       1. 在 CloakBrowser 模式下跳过 `Object.defineProperty(navigator, 'webdriver', {get: () => undefined})` 注入，保持 C++ 原生 `webdriver === false` 描述符；
+       2. 在 `_ensure_shared_token_binding` 清理并重绑账号 Cookie 时，自动保留 context 中已有的 `_GRECAPTCHA`、`AEC`、`NID`、`__Secure-ENID` 信任 Cookie；
+       3. 新增常驻打码标签页复用（`_shared_captcha_page`）与冷启动预热（Priming Execute）：打码后不关闭标签页，后续同项目打码直接在常驻已预热页面上模拟微交互（1.2s）并立即取码；首次冷启动页面时先执行一次 `PAGE_VIEW` 预热取码激活 `_GRECAPTCHA` 与行为轨迹，再获取业务动作（`IMAGE_GENERATION` / `VIDEO_GENERATION`）token。
 
 
 
 
-
-## 2026-11-09：打码配置漏存 `cloakbrowser_api_key`、保存 500 报错与 CloakBrowser 首次打码 500 重试优化
-
-- **现象**：
-  1. 用户在管理端配置 CloakBrowser License Key 并勾选静默后台运行后点击「保存配置」，弹出错误 `保存失败: Unexpected token 'I', "Internal S"... is not valid JSON`，且刷新或重新加载后 License Key 输入框变回空值。
-  2. 首次发起生图/生视频请求时，打码经常失败并报 500，必须连续重试 3 次才能成功。
-- **根因**：
-  1. **主 UPDATE 语句漏写字段**：[`Database.update_captcha_config`](src/core/database.py) 的 `UPDATE captcha_config SET ... WHERE id = 1` 语句中完全漏掉了 `cloakbrowser_api_key`、`browser_launch_background`、`twocaptcha_api_key`、`twocaptcha_base_url` 4 个字段；虽然末尾有二次 UPDATE，但在事务内且若前序查询未带入新值则导致保存被覆盖为空。前端保存后立即 `loadCaptchaConfig` 重新读库，读到空值导致输入框直接被置空。
-  2. **缺少全局安全异常保护与粗暴 JSON 解析**：[`src/api/admin.py`](src/api/admin.py) 中的 `update_captcha_config` 缺少顶层 `try...except` 保护，当底层触发任何未处理异常时直接由 ASGI 抛出 `HTTP 500 Internal Server Error` 纯文本；而 [`static/manage.html`](static/manage.html) 未判断 `r.ok` 直接执行 `await r.json()`，导致 JavaScript 解析纯文本 `"Internal Server Error"` 失败抛出 `Unexpected token 'I'`。
-  3. **CloakBrowser 单次标签页生命周期过短与有害的 JS 原型覆盖**：
-     - [`TokenBrowser._execute_captcha`](src/services/browser_captcha.py) 原先在每次打码时强制执行 `await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")`。CloakBrowser Pro 在 C++ 底层已原生伪装无痕，在页面层强行挂载自定义属性描述符会被 Google reCAPTCHA Enterprise 检测脚本直接识破并给出 < 0.3 的机器人极低分，导致 Google 后端 `ogiZ0b` 接口报 500。
-     - 每次打码都新建一个 tab，仅预热 6s 后取码并立即在 `finally` 中 `await page.close()` 销毁。由于没有留存任何前序人类行为信誉，首次打码必被 Google 风控打压；第 3 次重试才因为同一浏览器实例积累了网络耗时和 Cookie 勉强通过。
-- **修复方案**：
-  1. **重构数据库保存逻辑**（[`src/core/database.py`](src/core/database.py)）：在 `update_captcha_config` 中将 `cloakbrowser_api_key`、`browser_launch_background`、`twocaptcha_api_key`、`twocaptcha_base_url` 合并至主 `UPDATE` 与 `INSERT` 语句一次性原子写入，前置执行字段自动补齐，确保保存配置 100% 成功持久化。
-  2. **完善接口异常保护与前端解析**（[`src/api/admin.py`](src/api/admin.py)、[`static/manage.html`](static/manage.html)）：
-     - `update_captcha_config` 与 `get_captcha_runtime_status` 增加全局异常拦截，所有异常均包装为标准 JSON 返回（`success: False, message: "..."`），杜绝 500 纯文本响应；
-     - 前端安全提取非 JSON 响应内容，给出友好提示。
-  3. **实现 CloakBrowser 常驻项目页复用（Resident Project Page）并移除有害 JS 覆盖**（[`src/services/browser_captcha.py`](src/services/browser_captcha.py)）：
-     - 彻底移除 `navigator.webdriver = undefined` 的 prototype 覆盖脚本；
-     - 维护常驻项目页 `self._shared_project_page`，常规生图打码直接复用当前打开的 Flow 项目页执行，积累持久的人类交互信誉与 reCAPTCHA Enterprise telemetry 上报上下文，不再每次新建/销毁标签页，让首次打码即稳定获得高分通过。

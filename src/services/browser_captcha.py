@@ -2,8 +2,8 @@
 核心职责：基于 Playwright 的本地有头浏览器 reCAPTCHA 打码与常驻会话管理服务。
 主要功能：
 1. 管理 Token 级/共享级有头浏览器实例（支持 CloakBrowser Pro 内核环境检测、一键安装与授权 Key 管理）；
-2. 执行 Flow 页面预热、环境指纹对齐与 trusted reCAPTCHA / UI harvest 取码；
-3. 支持自动刷新 Session Token、代理注入与异常自愈重试。
+2. 执行常驻 Flow 项目页复用、冷启动 reCAPTCHA 信任预热（Priming）、原生 C++ 指纹保护与 trusted reCAPTCHA / UI harvest 取码；
+3. 支持自动刷新 Session Token、跨账号切换保留 `_GRECAPTCHA` 信任 Cookie、代理注入与异常自愈重试。
 """
 
 import os
@@ -807,8 +807,9 @@ class TokenBrowser:
         self._shared_browser = None
         self._shared_context = None
         self._shared_keepalive_page = None
-        self._shared_project_page = None
-        self._shared_project_id: Optional[str] = None
+        self._shared_captcha_page = None
+        self._shared_captcha_page_primed = False
+        self._shared_captcha_project_id: Optional[str] = None
         self._shared_browser_pid: Optional[int] = None
         self._shared_bound_token_id: Optional[int] = None
         self._shared_bound_cookie_signature: Optional[str] = None
@@ -1615,9 +1616,27 @@ class TokenBrowser:
             return False
 
         try:
+            # 保留已积累的 reCAPTCHA / Google 风控信任 Cookie（如 _GRECAPTCHA），避免切换或重绑账号时清空风控信任分
+            preserved_trust_cookies = []
+            try:
+                existing_cookies = await context.cookies()
+                incoming_names = {str(c.get("name") or "") for c in browser_cookies}
+                for ck in existing_cookies or []:
+                    ck_name = str(ck.get("name") or "")
+                    if ck_name in ("_GRECAPTCHA", "AEC", "NID", "__Secure-ENID") and ck_name not in incoming_names:
+                        clean_ck = {
+                            k: ck[k]
+                            for k in ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+                            if k in ck and ck[k] is not None
+                        }
+                        if clean_ck.get("name") and clean_ck.get("value") and clean_ck.get("domain"):
+                            preserved_trust_cookies.append(clean_ck)
+            except Exception:
+                pass
+
             await context.clear_cookies()
             scoped_cookies = []
-            regular_cookies = []
+            regular_cookies = list(preserved_trust_cookies)
             for cookie in browser_cookies:
                 target = scoped_cookies if cookie.get("url") and "path" in cookie else regular_cookies
                 target.append(cookie)
@@ -1637,11 +1656,14 @@ class TokenBrowser:
                             await page.close()
                     else:
                         await page.close()
+            if self._shared_bound_token_id != token_key:
+                # 账号发生切换时，标记常驻打码页需重新导航以加载新账号上下文，但保留 _GRECAPTCHA 信任
+                self._shared_captcha_project_id = None
             self._shared_bound_token_id = token_key
             self._shared_bound_cookie_signature = cookie_signature
             debug_logger.log_info(
                 f"[BrowserCaptcha] Token-{self.token_id} 已绑定业务 token 登录态到共享 context "
-                f"(token_id={token_key}, cookies={len(browser_cookies)})"
+                f"(token_id={token_key}, cookies={len(browser_cookies)}, preserved_trust={len(preserved_trust_cookies)})"
             )
             return True
         except Exception as e:
@@ -1693,18 +1715,23 @@ class TokenBrowser:
             except Exception:
                 await route.continue_()
 
-        try:
-            await page.route(
-                # 注意：Playwright glob 中单个 * 不跨越路径分隔符，
-                # StreamChat 的路径有多层目录（/_/AiSandboxAngularFrontend/...），
-                # 必须用 ** 才能匹配 flow.google.com 下的全部子路径。
-                "https://flow.google.com/**", _harvest_stream_route
-            )
-        except Exception as route_error:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} harvest route 注册失败: "
-                f"{type(route_error).__name__}: {str(route_error)[:150]}"
-            )
+        if not getattr(page, "_flow2api_harvest_routed", False):
+            try:
+                await page.route(
+                    # 注意：Playwright glob 中单个 * 不跨越路径分隔符，
+                    # StreamChat 的路径有多层目录（/_/AiSandboxAngularFrontend/...），
+                    # 必须用 ** 才能匹配 flow.google.com 下的全部子路径。
+                    "https://flow.google.com/**", _harvest_stream_route
+                )
+                try:
+                    page._flow2api_harvest_routed = True
+                except Exception:
+                    pass
+            except Exception as route_error:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} harvest route 注册失败: "
+                    f"{type(route_error).__name__}: {str(route_error)[:150]}"
+                )
 
         page_urls = [
             self._build_flow_project_url(project_id),
@@ -2083,18 +2110,18 @@ class TokenBrowser:
         browser = self._shared_browser
         context = self._shared_context
         keepalive_page = self._shared_keepalive_page
-        project_page = getattr(self, "_shared_project_page", None)
         browser_pid = self._shared_browser_pid or self._read_pid_file()
         had_browser = bool(
-            playwright or browser or context or keepalive_page or project_page or browser_pid
+            playwright or browser or context or keepalive_page or browser_pid
         )
 
         self._shared_playwright = None
         self._shared_browser = None
         self._shared_context = None
         self._shared_keepalive_page = None
-        self._shared_project_page = None
-        self._shared_project_id = None
+        self._shared_captcha_page = None
+        self._shared_captcha_page_primed = False
+        self._shared_captcha_project_id = None
         self._shared_browser_pid = None
         self._shared_proxy_url = None
         self._shared_launch_in_background = None
@@ -2608,46 +2635,99 @@ class TokenBrowser:
         if close_all:
             await self.recycle_browser(reason="force_close_all", rotate_profile=False)
 
+    async def _simulate_human_page_interaction(
+        self, page, settle_seconds: float = 1.5
+    ) -> None:
+        """在真实 Flow 页面上模拟自然的人类鼠标轨迹、滚轮与焦点事件，提升 reCAPTCHA Enterprise 行为遥测评分。"""
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            x1 = random.randint(240, 420)
+            y1 = random.randint(180, 300)
+            x2 = random.randint(520, 780)
+            y2 = random.randint(320, 500)
+            x3 = random.randint(380, 640)
+            y3 = random.randint(240, 420)
+            await page.mouse.move(x1, y1, steps=random.randint(8, 14))
+            await asyncio.sleep(random.uniform(0.08, 0.18))
+            await page.mouse.move(x2, y2, steps=random.randint(12, 20))
+            await page.mouse.wheel(0, random.randint(160, 320))
+            await asyncio.sleep(random.uniform(0.10, 0.22))
+            await page.mouse.move(x3, y3, steps=random.randint(10, 16))
+            await page.mouse.wheel(0, -random.randint(60, 140))
+            await page.evaluate(
+                """
+                (() => {
+                    try {
+                        window.focus();
+                        window.dispatchEvent(new Event('focus'));
+                        document.dispatchEvent(new MouseEvent('mousemove', {
+                            bubbles: true,
+                            clientX: Math.max(48, Math.floor((window.innerWidth || 1280) * 0.46)),
+                            clientY: Math.max(48, Math.floor((window.innerHeight || 720) * 0.38))
+                        }));
+                    } catch (e) {}
+                })()
+                """
+            )
+        except Exception:
+            pass
+        if settle_seconds > 0:
+            await asyncio.sleep(settle_seconds)
+
+    async def _ensure_resident_captcha_page(self, context):
+        """获取或创建常驻打码标签页，避免每次打码都新建并销毁标签页导致首次冷启动低分。"""
+        page = getattr(self, "_shared_captcha_page", None)
+        try:
+            if page and not page.is_closed():
+                return page, False
+        except Exception:
+            page = None
+
+        page = await context.new_page()
+        await self._apply_browser_environment_patch(page, label="captcha_page")
+        is_cloak = getattr(self, "_is_cloakbrowser", False) or (
+            getattr(config, "captcha_method", "") == "cloakbrowser"
+        )
+        # CloakBrowser Pro 已在 C++ 层设置 Navigator.prototype.webdriver = false；
+        # 仅在普通 Chromium 模式下注入 JS 覆盖，避免在 navigator 实例上留下异常的 undefined 属性描述符。
+        if not is_cloak:
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        await page.add_init_script(TRUSTED_RECAPTCHA_HOOK_SOURCE)
+        self._shared_captcha_page = page
+        self._shared_captcha_page_primed = False
+        self._shared_captcha_project_id = None
+        return page, True
+
     async def _execute_captcha(
         self, context, project_id: str, website_key: str, action: str
     ) -> Optional[str]:
         """Solve the requested action; native harvest is reserved for StreamChat."""
         normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
+        is_chat_harvest = normalized_action == "CHAT_GENERATION"
+        page = None
+        close_page_after = is_chat_harvest
         self._harvest_streamchat_post = None
         self._last_harvest_session_id = None
         debug_logger.log_info(
             f"[BrowserCaptcha] Token-{self.token_id} harvest 开始: "
             f"project={project_id} action={action}"
         )
-        is_chat_harvest = (normalized_action == "CHAT_GENERATION")
-        page = None
-        should_close_page = is_chat_harvest
-
         try:
-            if not is_chat_harvest and getattr(self, "_shared_project_page", None):
-                candidate = self._shared_project_page
-                try:
-                    if not candidate.is_closed():
-                        page = candidate
-                except Exception:
-                    page = None
-
-            is_new_page = (page is None)
-            if is_new_page:
+            if is_chat_harvest:
                 page = await context.new_page()
-                if not is_chat_harvest:
-                    self._shared_project_page = page
-                    self._shared_project_id = project_id
-                if not getattr(self, "_is_cloakbrowser", False):
-                    await self._apply_browser_environment_patch(page, label="captcha_page")
-                if not is_chat_harvest:
-                    await page.add_init_script(TRUSTED_RECAPTCHA_HOOK_SOURCE)
-
-            target_url = self._build_flow_project_url(project_id)
-            current_url = str(page.url or "")
-            need_navigate = is_new_page or (project_id and project_id not in current_url)
-
-            if need_navigate:
+                await self._apply_browser_environment_patch(page, label="captcha_page")
+                is_cloak = getattr(self, "_is_cloakbrowser", False) or (
+                    getattr(config, "captcha_method", "") == "cloakbrowser"
+                )
+                if not is_cloak:
+                    await page.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
                 ready = await self._prepare_flow_runtime_page(
                     page,
                     project_id,
@@ -2660,50 +2740,101 @@ class TokenBrowser:
                         f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
                         f"url={page.url[:80]}"
                     )
-                    should_close_page = True
                     return None
-            else:
-                debug_logger.log_info(
-                    f"[BrowserCaptcha] Token-{self.token_id} 复用常驻项目页: {current_url[:90]}"
+                harvest_result = await asyncio.wait_for(
+                    self._harvest_token_via_ui_submit(page),
+                    timeout=120,
                 )
+                if not harvest_result or not harvest_result.get("token"):
+                    return None
+                self._last_harvest_session_id = harvest_result.get("session_id")
+                return harvest_result.get("token")
+
+            # 非 CHAT_GENERATION（如 IMAGE_GENERATION / VIDEO_GENERATION）：复用常驻项目页
+            page, is_new_page = await self._ensure_resident_captcha_page(context)
+            target_project_key = str(project_id or "").strip()
+            reuse_warm_page = False
+            if (
+                not is_new_page
+                and getattr(self, "_shared_captcha_page_primed", False)
+                and self._shared_captcha_project_id == target_project_key
+            ):
                 try:
-                    await page.bring_to_front()
-                    await page.mouse.move(260 + (time.time() % 60), 220 + (time.time() % 50))
+                    current_url = str(page.url or "")
+                    has_enterprise = await page.evaluate(
+                        "Boolean(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')"
+                    )
+                    if has_enterprise and "flow.google.com" in current_url and "/404" not in current_url:
+                        reuse_warm_page = True
                 except Exception:
-                    pass
+                    reuse_warm_page = False
 
-            if not is_chat_harvest:
-                result = await asyncio.wait_for(
-                    page.evaluate(build_recaptcha_execute_script(website_key, normalized_action, 25000)),
-                    timeout=40,
+            if reuse_warm_page:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} 复用常驻已预热 Flow 页面直接取码: url={page.url[:120]}"
                 )
-                if isinstance(result, dict) and result.get("ok"):
-                    return str(result.get("token") or "").strip() or None
-                reason = str(result.get("error") or "empty token")[:240] if isinstance(result, dict) else "invalid result"
-                debug_logger.log_warning(f"[BrowserCaptcha] reCAPTCHA execute 未返回有效 token: {reason}")
-                should_close_page = True
-                return None
+                await self._simulate_human_page_interaction(page, settle_seconds=1.2)
+            else:
+                ready = await self._prepare_flow_runtime_page(
+                    page,
+                    project_id,
+                    website_key,
+                    action,
+                    context_label="打码",
+                )
+                if not ready:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
+                        f"url={page.url[:80]}"
+                    )
+                    close_page_after = True
+                    return None
 
-            harvest_result = await asyncio.wait_for(
-                self._harvest_token_via_ui_submit(page),
-                timeout=120,
+                # 首次冷启动页面（或新加载项目页）时，先执行一次预热取码激活 _GRECAPTCHA 与行为遥测，
+                # 避免第 1 次真实业务请求拿到冷启动低分 token 触发上游 500 错误。
+                if not getattr(self, "_shared_captcha_page_primed", False):
+                    try:
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] Token-{self.token_id} 首次冷启动常驻页面，执行 reCAPTCHA 信任预热 (priming execute)..."
+                        )
+                        await asyncio.wait_for(
+                            page.evaluate(
+                                build_recaptcha_execute_script(website_key, "PAGE_VIEW", 15000)
+                            ),
+                            timeout=20,
+                        )
+                    except Exception as prime_err:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] Token-{self.token_id} 预热 execute 忽略异常: {prime_err}"
+                        )
+                    await self._simulate_human_page_interaction(page, settle_seconds=2.0)
+                    self._shared_captcha_page_primed = True
+
+                self._shared_captcha_project_id = target_project_key
+
+            result = await asyncio.wait_for(
+                page.evaluate(build_recaptcha_execute_script(website_key, normalized_action, 25000)),
+                timeout=40,
             )
-            if not harvest_result or not harvest_result.get("token"):
-                return None
-            self._last_harvest_session_id = harvest_result.get("session_id")
-            return harvest_result.get("token")
+            if isinstance(result, dict) and result.get("ok"):
+                return str(result.get("token") or "").strip() or None
+            reason = str(result.get("error") or "empty token")[:240] if isinstance(result, dict) else "invalid result"
+            debug_logger.log_warning(f"[BrowserCaptcha] reCAPTCHA execute 未返回有效 token: {reason}")
+            self._shared_captcha_page_primed = False
+            return None
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)}"
             debug_logger.log_warning(
                 f"[BrowserCaptcha] Token-{self.token_id} 打码失败: {msg[:200]}"
             )
-            should_close_page = True
+            close_page_after = True
             return None
         finally:
-            if should_close_page and page:
-                if getattr(self, "_shared_project_page", None) is page:
-                    self._shared_project_page = None
-                    self._shared_project_id = None
+            if page and close_page_after:
+                if getattr(self, "_shared_captcha_page", None) is page:
+                    self._shared_captcha_page = None
+                    self._shared_captcha_page_primed = False
+                    self._shared_captcha_project_id = None
                 try:
                     await page.close()
                 except Exception:
@@ -2937,9 +3068,13 @@ class TokenBrowser:
             await self._apply_browser_environment_patch(
                 page, label="custom_captcha_page"
             )
-            await page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            is_cloak = getattr(self, "_is_cloakbrowser", False) or (
+                getattr(config, "captcha_method", "") == "cloakbrowser"
             )
+            if not is_cloak:
+                await page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
 
             primary_host = (
                 "https://www.recaptcha.net"
