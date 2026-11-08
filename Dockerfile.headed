@@ -17,13 +17,18 @@ RUN apt-get update \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# 在镜像构建阶段预装 Playwright Chromium，供 personal/browser 模式复用
+# 在镜像构建阶段预装 Playwright Chromium 与 CloakBrowser Pro 内核
 COPY requirements.txt ./
 
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
     && python -m playwright install --with-deps chromium
 
 COPY . .
+
+# 预装并缓存 CloakBrowser Pro 内核到镜像中
+RUN pip install --no-cache-dir cloakbrowser \
+    && python setup_cloakbrowser.py
+
 COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.headed.sh && chmod +x /usr/local/bin/entrypoint.headed.sh
 
