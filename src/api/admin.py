@@ -2093,162 +2093,171 @@ async def update_captcha_config(
     request: dict, token: str = Depends(verify_admin_token)
 ):
     """Update captcha configuration"""
-    captcha_method = normalize_captcha_method(request.get("captcha_method"))
-    yescaptcha_api_key = request.get("yescaptcha_api_key")
-    yescaptcha_base_url = request.get("yescaptcha_base_url")
-    yescaptcha_task_type = normalize_yescaptcha_task_type(
-        request.get("yescaptcha_task_type")
-    )
-    capmonster_api_key = request.get("capmonster_api_key")
-    capmonster_base_url = request.get("capmonster_base_url")
-    ezcaptcha_api_key = request.get("ezcaptcha_api_key")
-    ezcaptcha_base_url = request.get("ezcaptcha_base_url")
-    capsolver_api_key = request.get("capsolver_api_key")
-    capsolver_base_url = request.get("capsolver_base_url")
-    captcharun_api_key = request.get("captcharun_api_key")
-    captcharun_base_url = request.get("captcharun_base_url")
-    twocaptcha_api_key = request.get("twocaptcha_api_key")
-    twocaptcha_base_url = request.get("twocaptcha_base_url")
-    cloakbrowser_api_key = request.get("cloakbrowser_api_key")
-    if cloakbrowser_api_key is not None and not isinstance(cloakbrowser_api_key, str):
-        return {"success": False, "message": "CloakBrowser License Key 必须是字符串"}
-    if cloakbrowser_api_key is not None:
-        parsed_cb_keys = parse_cloakbrowser_keys(cloakbrowser_api_key)
-        cloakbrowser_api_key = "\n".join(parsed_cb_keys)
-        if parsed_cb_keys:
-            try:
-                from cloakbrowser.license import save_license_key
-
-                save_license_key(parsed_cb_keys[0])
-            except Exception:
-                pass
-    if twocaptcha_api_key is not None and not isinstance(twocaptcha_api_key, str):
-        return {"success": False, "message": "2Captcha API Key 必须是字符串"}
-    if twocaptcha_base_url is not None:
-        if not isinstance(twocaptcha_base_url, str):
-            return {"success": False, "message": "2Captcha API 地址必须是字符串"}
-        try:
-            twocaptcha_base_url = _normalize_http_base_url(twocaptcha_base_url.strip() or "https://api.2captcha.com")
-        except RuntimeError as exc:
-            return {"success": False, "message": str(exc)}
-    remote_browser_base_url = request.get("remote_browser_base_url")
-    remote_browser_api_key = request.get("remote_browser_api_key")
-    remote_browser_timeout = request.get("remote_browser_timeout", 60)
-    browser_proxy_enabled = request.get("browser_proxy_enabled", False)
-    browser_proxy_url = request.get("browser_proxy_url", "")
-    browser_count = request.get("browser_count", 1)
-    browser_launch_background = bool(request.get("browser_launch_background", True))
-    personal_project_pool_size = request.get("personal_project_pool_size")
-    personal_max_resident_tabs = request.get("personal_max_resident_tabs")
-    browser_personal_fresh_restart_every_n_solves = request.get(
-        "browser_personal_fresh_restart_every_n_solves",
-        10,
-    )
-    personal_idle_tab_ttl_seconds = request.get("personal_idle_tab_ttl_seconds")
-
-    # 验证浏览器代理URL格式
-    if browser_proxy_enabled and browser_proxy_url:
-        is_valid, error_msg = _validate_browser_proxy_url_local(browser_proxy_url)
-        if not is_valid:
-            return {"success": False, "message": error_msg}
-
-    if remote_browser_base_url:
-        try:
-            remote_browser_base_url = _normalize_http_base_url(remote_browser_base_url)
-        except RuntimeError as e:
-            return {"success": False, "message": str(e)}
-
     try:
-        remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
-    except Exception:
-        return {"success": False, "message": "远程打码超时时间必须是整数秒"}
-    try:
-        browser_count = max(1, min(20, int(browser_count or 1)))
-    except Exception:
-        return {"success": False, "message": "浏览器实例数量必须是整数"}
-    try:
-        browser_personal_fresh_restart_every_n_solves = max(
-            0,
-            int(
-                browser_personal_fresh_restart_every_n_solves
-                if browser_personal_fresh_restart_every_n_solves is not None
-                else 10
-            ),
+        captcha_method = normalize_captcha_method(request.get("captcha_method"))
+        yescaptcha_api_key = request.get("yescaptcha_api_key")
+        yescaptcha_base_url = request.get("yescaptcha_base_url")
+        yescaptcha_task_type = normalize_yescaptcha_task_type(
+            request.get("yescaptcha_task_type")
         )
-    except Exception:
-        return {"success": False, "message": "重置码数必须是整数，0 表示禁用"}
+        capmonster_api_key = request.get("capmonster_api_key")
+        capmonster_base_url = request.get("capmonster_base_url")
+        ezcaptcha_api_key = request.get("ezcaptcha_api_key")
+        ezcaptcha_base_url = request.get("ezcaptcha_base_url")
+        capsolver_api_key = request.get("capsolver_api_key")
+        capsolver_base_url = request.get("capsolver_base_url")
+        captcharun_api_key = request.get("captcharun_api_key")
+        captcharun_base_url = request.get("captcharun_base_url")
+        twocaptcha_api_key = request.get("twocaptcha_api_key")
+        twocaptcha_base_url = request.get("twocaptcha_base_url")
+        cloakbrowser_api_key = request.get("cloakbrowser_api_key")
+        if cloakbrowser_api_key is not None and not isinstance(cloakbrowser_api_key, str):
+            return {"success": False, "message": "CloakBrowser License Key 必须是字符串"}
+        if cloakbrowser_api_key is not None:
+            parsed_cb_keys = parse_cloakbrowser_keys(cloakbrowser_api_key)
+            cloakbrowser_api_key = "\n".join(parsed_cb_keys)
+            if parsed_cb_keys:
+                try:
+                    from cloakbrowser.license import save_license_key
 
-    if captcha_method == "remote_browser":
-        if not (remote_browser_base_url or "").strip():
-            return {
-                "success": False,
-                "message": "remote_browser 模式需要配置远程打码服务地址",
-            }
-        if not (remote_browser_api_key or "").strip():
-            return {
-                "success": False,
-                "message": "remote_browser 模式需要配置远程打码服务 API Key",
-            }
+                    save_license_key(parsed_cb_keys[0])
+                except Exception:
+                    pass
+        if twocaptcha_api_key is not None and not isinstance(twocaptcha_api_key, str):
+            return {"success": False, "message": "2Captcha API Key 必须是字符串"}
+        if twocaptcha_base_url is not None:
+            if not isinstance(twocaptcha_base_url, str):
+                return {"success": False, "message": "2Captcha API 地址必须是字符串"}
+            try:
+                twocaptcha_base_url = _normalize_http_base_url(twocaptcha_base_url.strip() or "https://api.2captcha.com")
+            except RuntimeError as exc:
+                return {"success": False, "message": str(exc)}
+        remote_browser_base_url = request.get("remote_browser_base_url")
+        remote_browser_api_key = request.get("remote_browser_api_key")
+        remote_browser_timeout = request.get("remote_browser_timeout", 60)
+        browser_proxy_enabled = request.get("browser_proxy_enabled", False)
+        browser_proxy_url = request.get("browser_proxy_url", "")
+        browser_count = request.get("browser_count", 1)
+        browser_launch_background = bool(request.get("browser_launch_background", True))
+        personal_project_pool_size = request.get("personal_project_pool_size")
+        personal_max_resident_tabs = request.get("personal_max_resident_tabs")
+        browser_personal_fresh_restart_every_n_solves = request.get(
+            "browser_personal_fresh_restart_every_n_solves",
+            10,
+        )
+        personal_idle_tab_ttl_seconds = request.get("personal_idle_tab_ttl_seconds")
 
-    await db.update_captcha_config(
-        captcha_method=captcha_method,
-        yescaptcha_api_key=yescaptcha_api_key,
-        yescaptcha_base_url=yescaptcha_base_url,
-        yescaptcha_task_type=yescaptcha_task_type,
-        capmonster_api_key=capmonster_api_key,
-        capmonster_base_url=capmonster_base_url,
-        ezcaptcha_api_key=ezcaptcha_api_key,
-        ezcaptcha_base_url=ezcaptcha_base_url,
-        capsolver_api_key=capsolver_api_key,
-        capsolver_base_url=capsolver_base_url,
-        captcharun_api_key=captcharun_api_key,
-        captcharun_base_url=captcharun_base_url,
-        twocaptcha_api_key=twocaptcha_api_key,
-        twocaptcha_base_url=twocaptcha_base_url,
-        cloakbrowser_api_key=cloakbrowser_api_key,
-        remote_browser_base_url=remote_browser_base_url,
-        remote_browser_api_key=remote_browser_api_key,
-        remote_browser_timeout=remote_browser_timeout,
-        browser_proxy_enabled=browser_proxy_enabled,
-        browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
-        browser_count=browser_count,
-        browser_launch_background=browser_launch_background,
-        personal_project_pool_size=personal_project_pool_size,
-        personal_max_resident_tabs=personal_max_resident_tabs,
-        browser_personal_fresh_restart_every_n_solves=browser_personal_fresh_restart_every_n_solves,
-        personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds,
-    )
+        # 验证浏览器代理URL格式
+        if browser_proxy_enabled and browser_proxy_url:
+            is_valid, error_msg = _validate_browser_proxy_url_local(browser_proxy_url)
+            if not is_valid:
+                return {"success": False, "message": error_msg}
 
-    # 🔥 Hot reload: sync database config to memory
-    await db.reload_config_to_memory()
+        if remote_browser_base_url:
+            try:
+                remote_browser_base_url = _normalize_http_base_url(remote_browser_base_url)
+            except RuntimeError as e:
+                return {"success": False, "message": str(e)}
 
-    runtime_prepare_started = False
-    runtime_prepare_message = ""
-    runtime_status_method = None
-
-    if captcha_method in {"browser", "cloakbrowser", "personal"}:
-        runtime_status_method = captcha_method
-        runtime_prepare_started = _schedule_captcha_runtime_prepare(captcha_method)
-        if captcha_method == "cloakbrowser":
-            runtime_prepare_message = (
-                "已开始准备 CloakBrowser 打码运行环境，安装进度将自动显示。"
+        try:
+            remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
+        except Exception:
+            return {"success": False, "message": "远程打码超时时间必须是整数秒"}
+        try:
+            browser_count = max(1, min(20, int(browser_count or 1)))
+        except Exception:
+            return {"success": False, "message": "浏览器实例数量必须是整数"}
+        try:
+            browser_personal_fresh_restart_every_n_solves = max(
+                0,
+                int(
+                    browser_personal_fresh_restart_every_n_solves
+                    if browser_personal_fresh_restart_every_n_solves is not None
+                    else 10
+                ),
             )
-        elif captcha_method == "browser":
-            runtime_prepare_message = (
-                "已开始准备有头浏览器打码运行环境，安装进度将自动显示。"
-            )
-        else:
-            runtime_prepare_message = (
-                "已开始准备内置浏览器打码运行环境，安装进度将自动显示。"
-            )
+        except Exception:
+            return {"success": False, "message": "重置码数必须是整数，0 表示禁用"}
 
-    return {
-        "success": True,
-        "message": "验证码配置更新成功",
-        "runtime_prepare_started": runtime_prepare_started,
-        "runtime_prepare_message": runtime_prepare_message,
-        "runtime_status_method": runtime_status_method,
-    }
+        if captcha_method == "remote_browser":
+            if not (remote_browser_base_url or "").strip():
+                return {
+                    "success": False,
+                    "message": "remote_browser 模式需要配置远程打码服务地址",
+                }
+            if not (remote_browser_api_key or "").strip():
+                return {
+                    "success": False,
+                    "message": "remote_browser 模式需要配置远程打码服务 API Key",
+                }
+
+        await db.update_captcha_config(
+            captcha_method=captcha_method,
+            yescaptcha_api_key=yescaptcha_api_key,
+            yescaptcha_base_url=yescaptcha_base_url,
+            yescaptcha_task_type=yescaptcha_task_type,
+            capmonster_api_key=capmonster_api_key,
+            capmonster_base_url=capmonster_base_url,
+            ezcaptcha_api_key=ezcaptcha_api_key,
+            ezcaptcha_base_url=ezcaptcha_base_url,
+            capsolver_api_key=capsolver_api_key,
+            capsolver_base_url=capsolver_base_url,
+            captcharun_api_key=captcharun_api_key,
+            captcharun_base_url=captcharun_base_url,
+            twocaptcha_api_key=twocaptcha_api_key,
+            twocaptcha_base_url=twocaptcha_base_url,
+            cloakbrowser_api_key=cloakbrowser_api_key,
+            remote_browser_base_url=remote_browser_base_url,
+            remote_browser_api_key=remote_browser_api_key,
+            remote_browser_timeout=remote_browser_timeout,
+            browser_proxy_enabled=browser_proxy_enabled,
+            browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
+            browser_count=browser_count,
+            browser_launch_background=browser_launch_background,
+            personal_project_pool_size=personal_project_pool_size,
+            personal_max_resident_tabs=personal_max_resident_tabs,
+            browser_personal_fresh_restart_every_n_solves=browser_personal_fresh_restart_every_n_solves,
+            personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds,
+        )
+
+        # 🔥 Hot reload: sync database config to memory
+        await db.reload_config_to_memory()
+
+        runtime_prepare_started = False
+        runtime_prepare_message = ""
+        runtime_status_method = None
+
+        if captcha_method in {"browser", "cloakbrowser", "personal"}:
+            runtime_status_method = captcha_method
+            try:
+                runtime_prepare_started = _schedule_captcha_runtime_prepare(captcha_method)
+            except Exception as sched_err:
+                logger.warning(f"[Admin] 触发打码环境自动准备失败: {sched_err}")
+                runtime_prepare_started = False
+
+            if captcha_method == "cloakbrowser":
+                runtime_prepare_message = (
+                    "已开始准备 CloakBrowser 打码运行环境，安装进度将自动显示。"
+                )
+            elif captcha_method == "browser":
+                runtime_prepare_message = (
+                    "已开始准备有头浏览器打码运行环境，安装进度将自动显示。"
+                )
+            else:
+                runtime_prepare_message = (
+                    "已开始准备内置浏览器打码运行环境，安装进度将自动显示。"
+                )
+
+        return {
+            "success": True,
+            "message": "验证码配置更新成功",
+            "runtime_prepare_started": runtime_prepare_started,
+            "runtime_prepare_message": runtime_prepare_message,
+            "runtime_status_method": runtime_status_method,
+        }
+    except Exception as exc:
+        logger.error(f"[Admin] 保存验证码配置失败: {exc}", exc_info=True)
+        return {"success": False, "message": f"保存配置失败: {str(exc)}"}
 
 
 @router.get("/api/captcha/runtime-status")
@@ -2256,9 +2265,15 @@ async def get_captcha_runtime_status(
     method: str = "browser", token: str = Depends(verify_admin_token)
 ):
     """Get background browser runtime preparation status."""
-    runtime_method = _normalize_runtime_method(method)
+    try:
+        runtime_method = _normalize_runtime_method(method)
+    except Exception:
+        runtime_method = "browser"
     task = captcha_runtime_prepare_tasks.get(runtime_method)
-    status = get_runtime_status(runtime_method)
+    try:
+        status = get_runtime_status(runtime_method)
+    except Exception:
+        status = {"state": "idle", "active": False, "message": "", "error": ""}
     status["method"] = runtime_method
     status["task_running"] = bool(task and not task.done())
     return status

@@ -807,6 +807,8 @@ class TokenBrowser:
         self._shared_browser = None
         self._shared_context = None
         self._shared_keepalive_page = None
+        self._shared_project_page = None
+        self._shared_project_id: Optional[str] = None
         self._shared_browser_pid: Optional[int] = None
         self._shared_bound_token_id: Optional[int] = None
         self._shared_bound_cookie_signature: Optional[str] = None
@@ -2081,15 +2083,18 @@ class TokenBrowser:
         browser = self._shared_browser
         context = self._shared_context
         keepalive_page = self._shared_keepalive_page
+        project_page = getattr(self, "_shared_project_page", None)
         browser_pid = self._shared_browser_pid or self._read_pid_file()
         had_browser = bool(
-            playwright or browser or context or keepalive_page or browser_pid
+            playwright or browser or context or keepalive_page or project_page or browser_pid
         )
 
         self._shared_playwright = None
         self._shared_browser = None
         self._shared_context = None
         self._shared_keepalive_page = None
+        self._shared_project_page = None
+        self._shared_project_id = None
         self._shared_browser_pid = None
         self._shared_proxy_url = None
         self._shared_launch_in_background = None
@@ -2608,36 +2613,66 @@ class TokenBrowser:
     ) -> Optional[str]:
         """Solve the requested action; native harvest is reserved for StreamChat."""
         normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
-        page = None
         self._harvest_streamchat_post = None
         self._last_harvest_session_id = None
         debug_logger.log_info(
             f"[BrowserCaptcha] Token-{self.token_id} harvest 开始: "
             f"project={project_id} action={action}"
         )
-        try:
-            page = await context.new_page()
-            await self._apply_browser_environment_patch(page, label="captcha_page")
-            await page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            if normalized_action != "CHAT_GENERATION":
-                await page.add_init_script(TRUSTED_RECAPTCHA_HOOK_SOURCE)
-            ready = await self._prepare_flow_runtime_page(
-                page,
-                project_id,
-                website_key,
-                action,
-                context_label="打码",
-            )
-            if not ready:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
-                    f"url={page.url[:80]}"
-                )
-                return None
+        is_chat_harvest = (normalized_action == "CHAT_GENERATION")
+        page = None
+        should_close_page = is_chat_harvest
 
-            if normalized_action != "CHAT_GENERATION":
+        try:
+            if not is_chat_harvest and getattr(self, "_shared_project_page", None):
+                candidate = self._shared_project_page
+                try:
+                    if not candidate.is_closed():
+                        page = candidate
+                except Exception:
+                    page = None
+
+            is_new_page = (page is None)
+            if is_new_page:
+                page = await context.new_page()
+                if not is_chat_harvest:
+                    self._shared_project_page = page
+                    self._shared_project_id = project_id
+                if not getattr(self, "_is_cloakbrowser", False):
+                    await self._apply_browser_environment_patch(page, label="captcha_page")
+                if not is_chat_harvest:
+                    await page.add_init_script(TRUSTED_RECAPTCHA_HOOK_SOURCE)
+
+            target_url = self._build_flow_project_url(project_id)
+            current_url = str(page.url or "")
+            need_navigate = is_new_page or (project_id and project_id not in current_url)
+
+            if need_navigate:
+                ready = await self._prepare_flow_runtime_page(
+                    page,
+                    project_id,
+                    website_key,
+                    action,
+                    context_label="打码",
+                )
+                if not ready:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
+                        f"url={page.url[:80]}"
+                    )
+                    should_close_page = True
+                    return None
+            else:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} 复用常驻项目页: {current_url[:90]}"
+                )
+                try:
+                    await page.bring_to_front()
+                    await page.mouse.move(260 + (time.time() % 60), 220 + (time.time() % 50))
+                except Exception:
+                    pass
+
+            if not is_chat_harvest:
                 result = await asyncio.wait_for(
                     page.evaluate(build_recaptcha_execute_script(website_key, normalized_action, 25000)),
                     timeout=40,
@@ -2646,6 +2681,7 @@ class TokenBrowser:
                     return str(result.get("token") or "").strip() or None
                 reason = str(result.get("error") or "empty token")[:240] if isinstance(result, dict) else "invalid result"
                 debug_logger.log_warning(f"[BrowserCaptcha] reCAPTCHA execute 未返回有效 token: {reason}")
+                should_close_page = True
                 return None
 
             harvest_result = await asyncio.wait_for(
@@ -2661,12 +2697,16 @@ class TokenBrowser:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] Token-{self.token_id} 打码失败: {msg[:200]}"
             )
+            should_close_page = True
             return None
         finally:
-            if page:
+            if should_close_page and page:
+                if getattr(self, "_shared_project_page", None) is page:
+                    self._shared_project_page = None
+                    self._shared_project_id = None
                 try:
                     await page.close()
-                except:
+                except Exception:
                     pass
 
     HARVEST_PROMPT_POOL = (

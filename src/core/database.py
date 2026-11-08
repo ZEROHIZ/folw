@@ -2424,6 +2424,21 @@ class Database:
         """Update captcha configuration"""
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
+
+            # 确保 captcha_config 中新引入的字段在旧数据库中已存在，若不存在自动安全补齐
+            for col, col_def in (
+                ("browser_launch_background", "BOOLEAN DEFAULT 1"),
+                ("cloakbrowser_api_key", "TEXT DEFAULT ''"),
+                ("twocaptcha_api_key", "TEXT DEFAULT ''"),
+                ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
+                ("browser_count", "INTEGER DEFAULT 1"),
+            ):
+                if not await self._column_exists(db, "captcha_config", col):
+                    try:
+                        await db.execute(f"ALTER TABLE captcha_config ADD COLUMN {col} {col_def}")
+                    except Exception as e:
+                        print(f"[Database] 补齐字段 {col} 失败: {e}")
+
             cursor = await db.execute("SELECT * FROM captcha_config WHERE id = 1")
             row = await cursor.fetchone()
 
@@ -2494,6 +2509,28 @@ class Database:
                     else current.get(
                         "captcharun_base_url", "https://api.captcha-run.com"
                     )
+                )
+                new_two_key = (
+                    twocaptcha_api_key
+                    if twocaptcha_api_key is not None
+                    else current.get("twocaptcha_api_key", "")
+                )
+                new_two_url = (
+                    twocaptcha_base_url
+                    if twocaptcha_base_url is not None
+                    else current.get(
+                        "twocaptcha_base_url", "https://api.2captcha.com"
+                    )
+                )
+                new_cloak_key = (
+                    cloakbrowser_api_key
+                    if cloakbrowser_api_key is not None
+                    else current.get("cloakbrowser_api_key", "")
+                )
+                new_launch_bg = (
+                    bool(browser_launch_background)
+                    if browser_launch_background is not None
+                    else bool(current.get("browser_launch_background", True))
                 )
                 new_remote_base_url = (
                     remote_browser_base_url
@@ -2573,6 +2610,8 @@ class Database:
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         captcharun_api_key = ?, captcharun_base_url = ?,
+                        twocaptcha_api_key = ?, twocaptcha_base_url = ?,
+                        cloakbrowser_api_key = ?, browser_launch_background = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
                         browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
                         personal_project_pool_size = ?,
@@ -2595,6 +2634,10 @@ class Database:
                         new_cs_url,
                         new_run_key,
                         new_run_url,
+                        new_two_key,
+                        new_two_url,
+                        new_cloak_key,
+                        new_launch_bg,
                         (new_remote_base_url or "").strip(),
                         (new_remote_api_key or "").strip(),
                         new_remote_timeout,
@@ -2647,6 +2690,22 @@ class Database:
                     captcharun_base_url
                     if captcharun_base_url is not None
                     else "https://api.captcha-run.com"
+                )
+                new_two_key = (
+                    twocaptcha_api_key if twocaptcha_api_key is not None else ""
+                )
+                new_two_url = (
+                    twocaptcha_base_url
+                    if twocaptcha_base_url is not None
+                    else "https://api.2captcha.com"
+                )
+                new_cloak_key = (
+                    cloakbrowser_api_key if cloakbrowser_api_key is not None else ""
+                )
+                new_launch_bg = (
+                    bool(browser_launch_background)
+                    if browser_launch_background is not None
+                    else True
                 )
                 new_remote_base_url = (
                     remote_browser_base_url
@@ -2704,12 +2763,14 @@ class Database:
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         captcharun_api_key, captcharun_base_url,
+                        twocaptcha_api_key, twocaptcha_base_url,
+                        cloakbrowser_api_key, browser_launch_background,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                         browser_proxy_enabled, browser_proxy_url, browser_count,
                         personal_project_pool_size,
                         personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
                         personal_idle_tab_ttl_seconds)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         new_method,
@@ -2724,6 +2785,10 @@ class Database:
                         new_cs_url,
                         new_run_key,
                         new_run_url,
+                        new_two_key,
+                        new_two_url,
+                        new_cloak_key,
+                        new_launch_bg,
                         (new_remote_base_url or "").strip(),
                         (new_remote_api_key or "").strip(),
                         new_remote_timeout,
@@ -2737,42 +2802,6 @@ class Database:
                     ),
                 )
 
-            # 确保 captcha_config 中新引入的字段在旧数据库中已存在，若不存在自动安全补齐
-            for col, col_def in (
-                ("browser_launch_background", "BOOLEAN DEFAULT 1"),
-                ("cloakbrowser_api_key", "TEXT DEFAULT ''"),
-                ("twocaptcha_api_key", "TEXT DEFAULT ''"),
-                ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
-                ("browser_count", "INTEGER DEFAULT 1"),
-            ):
-                if not await self._column_exists(db, "captcha_config", col):
-                    try:
-                        await db.execute(f"ALTER TABLE captcha_config ADD COLUMN {col} {col_def}")
-                    except Exception as e:
-                        print(f"[Database] 补齐字段 {col} 失败: {e}")
-
-            # Keep the new provider update in the same transaction as the existing fields.
-            previous_captcha = dict(row) if row else {}
-            new_launch_background = (
-                bool(browser_launch_background)
-                if browser_launch_background is not None
-                else bool(previous_captcha.get("browser_launch_background", True))
-            )
-            await db.execute(
-                "UPDATE captcha_config SET twocaptcha_api_key = ?, twocaptcha_base_url = ?, cloakbrowser_api_key = ?, browser_launch_background = ? WHERE id = 1",
-                (
-                    twocaptcha_api_key
-                    if twocaptcha_api_key is not None
-                    else previous_captcha.get("twocaptcha_api_key", ""),
-                    twocaptcha_base_url
-                    if twocaptcha_base_url is not None
-                    else previous_captcha.get("twocaptcha_base_url", "https://api.2captcha.com"),
-                    cloakbrowser_api_key
-                    if cloakbrowser_api_key is not None
-                    else previous_captcha.get("cloakbrowser_api_key", ""),
-                    new_launch_background,
-                ),
-            )
             await db.commit()
 
     # Plugin config operations
