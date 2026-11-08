@@ -973,6 +973,7 @@ class Database:
                     browser_proxy_enabled BOOLEAN DEFAULT 0,
                     browser_proxy_url TEXT,
                     browser_count INTEGER DEFAULT 1,
+                    browser_launch_background BOOLEAN DEFAULT 1,
                     personal_project_pool_size INTEGER DEFAULT 4,
                     personal_max_resident_tabs INTEGER DEFAULT 5,
                     browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
@@ -1017,6 +1018,67 @@ class Database:
 
             # Migrate request_logs table if needed
             await self._migrate_request_logs(db)
+
+            # 自动迁移历史数据库表字段（确保已有数据库平滑升级，补齐缺失列）
+            await self._migrate_columns_for_table(db, "captcha_config", [
+                ("browser_proxy_enabled", "BOOLEAN DEFAULT 0"),
+                ("browser_proxy_url", "TEXT"),
+                ("yescaptcha_task_type", "TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9'"),
+                ("capmonster_api_key", "TEXT DEFAULT ''"),
+                ("capmonster_base_url", "TEXT DEFAULT 'https://api.capmonster.cloud'"),
+                ("ezcaptcha_api_key", "TEXT DEFAULT ''"),
+                ("ezcaptcha_base_url", "TEXT DEFAULT 'https://api.ez-captcha.com'"),
+                ("capsolver_api_key", "TEXT DEFAULT ''"),
+                ("capsolver_base_url", "TEXT DEFAULT 'https://api.capsolver.com'"),
+                ("twocaptcha_api_key", "TEXT DEFAULT ''"),
+                ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
+                ("cloakbrowser_api_key", "TEXT DEFAULT ''"),
+                ("captcharun_api_key", "TEXT DEFAULT ''"),
+                ("captcharun_base_url", "TEXT DEFAULT 'https://api.captcha-run.com'"),
+                ("browser_count", "INTEGER DEFAULT 1"),
+                ("browser_launch_background", "BOOLEAN DEFAULT 1"),
+                ("personal_project_pool_size", "INTEGER DEFAULT 4"),
+                ("personal_max_resident_tabs", "INTEGER DEFAULT 5"),
+                ("browser_personal_fresh_restart_every_n_solves", "INTEGER DEFAULT 10"),
+                ("personal_idle_tab_ttl_seconds", "INTEGER DEFAULT 600"),
+                ("remote_browser_base_url", "TEXT DEFAULT ''"),
+                ("remote_browser_api_key", "TEXT DEFAULT ''"),
+                ("remote_browser_timeout", "INTEGER DEFAULT 60"),
+            ])
+            await self._migrate_columns_for_table(db, "tokens", [
+                ("proxy_url", "TEXT"),
+                ("token_type", "TEXT DEFAULT 'web'"),
+                ("refresh_token", "TEXT"),
+                ("client_id", "TEXT"),
+                ("client_secret", "TEXT"),
+                ("tier", "TEXT DEFAULT 'free'"),
+                ("current_project_id", "TEXT"),
+                ("auto_renew", "BOOLEAN DEFAULT 1"),
+                ("video_concurrency", "INTEGER DEFAULT 3"),
+                ("credits", "INTEGER DEFAULT 0"),
+                ("user_paygate_tier", "TEXT"),
+                ("ban_reason", "TEXT"),
+                ("banned_at", "TIMESTAMP"),
+                ("error_count", "INTEGER DEFAULT 0"),
+                ("last_error_at", "TIMESTAMP"),
+                ("last_error_reason", "TEXT"),
+                ("google_cookies", "TEXT"),
+            ])
+            await self._migrate_columns_for_table(db, "token_stats", [
+                ("today_image_count", "INTEGER DEFAULT 0"),
+                ("today_video_count", "INTEGER DEFAULT 0"),
+                ("today_error_count", "INTEGER DEFAULT 0"),
+                ("today_date", "DATE"),
+                ("consecutive_error_count", "INTEGER DEFAULT 0"),
+            ])
+            await self._migrate_columns_for_table(db, "plugin_config", [
+                ("auto_enable_on_update", "BOOLEAN DEFAULT 1"),
+            ])
+            await self._migrate_columns_for_table(db, "token_refresh_config", [
+                ("enabled", "BOOLEAN DEFAULT 1"),
+                ("refresh_interval_minutes", "INTEGER DEFAULT 30"),
+                ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ])
 
             # Request logs query indexes (列表按 created_at 排序 / token 过滤)
             await db.execute(
@@ -1105,6 +1167,18 @@ class Database:
         except Exception as e:
             print(f"?? request_logs?????: {e}")
             # Continue even if migration fails
+
+    async def _migrate_columns_for_table(self, db, table_name: str, columns: list[tuple[str, str]]):
+        """自动检查并补齐数据表缺失的字段（平滑升级旧数据库）"""
+        if not await self._table_exists(db, table_name):
+            return
+        for col_name, col_type in columns:
+            if not await self._column_exists(db, table_name, col_name):
+                try:
+                    await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+                    debug_logger.log_info(f"[Database] 自动补齐数据表缺失字段: {table_name}.{col_name}")
+                except Exception as e:
+                    debug_logger.log_warning(f"[Database] 补齐字段失败 {table_name}.{col_name}: {e}")
 
     async def _ensure_token_identity_available(
         self,
@@ -2662,6 +2736,20 @@ class Database:
                         new_personal_idle_ttl,
                     ),
                 )
+
+            # 确保 captcha_config 中新引入的字段在旧数据库中已存在，若不存在自动安全补齐
+            for col, col_def in (
+                ("browser_launch_background", "BOOLEAN DEFAULT 1"),
+                ("cloakbrowser_api_key", "TEXT DEFAULT ''"),
+                ("twocaptcha_api_key", "TEXT DEFAULT ''"),
+                ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
+                ("browser_count", "INTEGER DEFAULT 1"),
+            ):
+                if not await self._column_exists(db, "captcha_config", col):
+                    try:
+                        await db.execute(f"ALTER TABLE captcha_config ADD COLUMN {col} {col_def}")
+                    except Exception as e:
+                        debug_logger.log_warning(f"[Database] 补齐字段 {col} 失败: {e}")
 
             # Keep the new provider update in the same transaction as the existing fields.
             previous_captcha = dict(row) if row else {}

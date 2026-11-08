@@ -66,6 +66,16 @@
   2. 将 [`BrowserCaptchaService.QUEUE_WAIT_SECONDS`](src/services/browser_captcha.py) 提升至 `600.0` 秒（并动态取 `max(600.0, image_timeout * 2)`）。
   3. 在 [`src/api/admin.py`](src/api/admin.py) 与 [`static/manage.html`](static/manage.html) 中新增「队列任务」标签页与取消接口（`GET /api/queue/tasks`、`POST /api/queue/{task_id}/cancel`、`POST /api/queue/cancel-all`）。
 
+## 2026-11-09：历史数据库缺少 `browser_launch_background` 字段导致点击「保存配置」报错 500
+
+- **现象**：
+  - 用户在后台管理界面配置打码参数点击「保存配置」时，请求 `POST /api/captcha/config` 报 `500 Internal Server Error`，日志显示 `sqlite3.OperationalError: no such column: browser_launch_background`，前端提示 `保存失败: Unexpected token 'I', "Internal S"... is not valid JSON`。
+- **根因**：
+  - 用户的数据库文件（`data/flow2api.db`）是从旧版本挂载过来的，而系统启动入口 [`Database.init_db()`](src/core/database.py) 仅调用了 `CREATE TABLE IF NOT EXISTS`，未在启动时对已存在的数据表执行列补齐迁移；同时 [`update_captcha_config`](src/core/database.py) 的 `UPDATE` 语句直接写入了 `browser_launch_background`，遇到旧数据库缺失该字段时触发 SQLite 运行时错误。
+- **修复方案**：
+  1. 在 [`Database.init_db()`](src/core/database.py) 中将 `browser_launch_background BOOLEAN DEFAULT 1` 加入表结构定义，并在服务启动时自动调用 `_migrate_columns_for_table` 对 `captcha_config`、`tokens`、`token_stats`、`plugin_config` 等历史表执行平滑字段补齐。
+  2. 在 [`Database.update_captcha_config()`](src/core/database.py) 执行 `UPDATE` 之前加入防御性自愈检测：自动校验 `browser_launch_background`、`cloakbrowser_api_key`、`twocaptcha_api_key` 等新增字段，若不存在则在当前会话内自动执行 `ALTER TABLE ADD COLUMN` 补齐，确保保存配置 100% 成功。
+
 ## 2026-11-09：移除 CloakBrowser 静默回退，内核与授权缺失时直接显式报错阻断
 
 - **现象**：
