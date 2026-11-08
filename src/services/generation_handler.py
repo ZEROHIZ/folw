@@ -1,4 +1,9 @@
-"""Generation handler for Flow2API"""
+"""
+核心职责：Flow2API 统一生成处理器（GenerationHandler）。
+主要功能：
+1. 接收图片与视频生成请求，接入 GenerationQueueManager 进行 FIFO 排队调度、并发控制与手动取消响应；
+2. 负责 Token 选择、AT/Session 有效性检查、Project 准备、上游生成与放大轮询、本地缓存及请求日志记录。
+"""
 
 import asyncio
 import base64
@@ -19,6 +24,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .queue_manager import queue_manager
 
 
 def _video_poll_attempt_budget(
@@ -31,6 +37,13 @@ def _video_poll_attempt_budget(
     timeout = max(interval, float(timeout_seconds or 0))
     attempts = max(1, math.ceil(timeout / interval))
     return attempts * (3 if upsample else 1)
+
+
+# 账号配额耗尽/风控时，单个请求最多尝试的账号数（含首个账号）
+MAX_TOKEN_FAILOVER_ATTEMPTS = 6
+# 其中因风控 (UNUSUAL_ACTIVITY) 失败的账号数上限：每次风控要耗费两轮打码，
+# 而配额耗尽的账号会立即失败，不占用这部分额度
+MAX_RISK_FAILOVER_ATTEMPTS = 3
 
 
 # Model configuration
@@ -705,36 +718,37 @@ MODEL_CONFIG = {
         "requires_video_id": True,
     },
     # ========== Gemini Omni Flash ==========
-    # 2026-05-26 实测上游真实请求：
-    # - 纯文本 -> YhhmEf, videoModelKey=abra_t2v_8s
-    # - 参考图 -> MZZa6b, videoModelKey=abra_r2v_8s
+    # 2026-11-08 实测上游真实请求：
+    # - 纯文本 -> YhhmEf, videoModelKey=macaron_cookie_t2v_8s
+    # - 参考图 -> MZZa6b, videoModelKey=macaron_cookie_r2v_8s
+    # - 上一代 Omni 1.1 (abra) 上游已标记 "Leaving Dec 5"，2026-12-05 下线
     "omni": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "abra_t2v_8s",
+        "model_key": "macaron_cookie_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 0,
         "max_images": 3,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "abra_r2v_8s",
+        "reference_model_key": "macaron_cookie_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni Flash",
+        "reference_model_display_name": "Omni 1.2 Flash",
     },
     "omni_portrait": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "abra_t2v_8s",
+        "model_key": "macaron_cookie_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
         "supports_images": True,
         "min_images": 0,
         "max_images": 3,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "abra_r2v_8s",
+        "reference_model_key": "macaron_cookie_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni Flash",
+        "reference_model_display_name": "Omni 1.2 Flash",
     },
 }
 
@@ -1228,7 +1242,8 @@ def _apply_current_flow_model_catalog():
         )
 
     # Omni 1.1 Flash (upstream family key: abra). This is verified by a live
-    # generation using abra_t2v_4s.
+    # generation using abra_t2v_4s. Upstream marks this family "Leaving Dec 5"
+    # (removed on 2026-12-05); kept until then for existing callers.
     for seconds in (4, 6, 8, 10):
         for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
             register(
@@ -1248,6 +1263,48 @@ def _apply_current_flow_model_catalog():
                 },
                 f"Omni 1.1 Flash · {seconds}s · {orientation}",
             )
+
+    # Omni 1.2 Flash (upstream family key: macaron_cookie). Verified by a live
+    # generation captured on 2026-11-08: YhhmEf with videoModelKey
+    # macaron_cookie_t2v_8s. 3s-10s cover landscape and portrait; 11s-15s are
+    # portrait-only in the upstream catalog.
+    for seconds in (3, 4, 5, 6, 7, 8, 9, 10):
+        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
+            register(
+                f"omni-1.2-flash-{seconds}s-{orientation}",
+                {
+                    "type": "video",
+                    "video_type": "omni",
+                    "model_key": f"macaron_cookie_t2v_{seconds}s",
+                    "reference_model_key": f"macaron_cookie_r2v_{seconds}s",
+                    "reference_duration": seconds,
+                    "aspect_ratio": ratio,
+                    "supports_images": True,
+                    "min_images": 0,
+                    "max_images": 3,
+                    "use_v2_model_config": True,
+                    "allow_tier_upgrade": False,
+                },
+                f"Omni 1.2 Flash · {seconds}s · {orientation}",
+            )
+    for seconds in (11, 12, 13, 14, 15):
+        register(
+            f"omni-1.2-flash-{seconds}s-portrait",
+            {
+                "type": "video",
+                "video_type": "omni",
+                "model_key": f"macaron_cookie_t2v_{seconds}s",
+                "reference_model_key": f"macaron_cookie_r2v_{seconds}s",
+                "reference_duration": seconds,
+                "aspect_ratio": portrait,
+                "supports_images": True,
+                "min_images": 0,
+                "max_images": 3,
+                "use_v2_model_config": True,
+                "allow_tier_upgrade": False,
+            },
+            f"Omni 1.2 Flash · {seconds}s · portrait",
+        )
 
     # Current image-to-video and reference-video variants.
     for seconds, lite_key, fast_key, quality_key in (
@@ -1595,7 +1652,7 @@ class GenerationHandler:
         response_state["base_url"] = (base_url_override or "").strip().rstrip(
             "/"
         ) or None
-        request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
+        request_log_state: Dict[str, Any] = {"id": None, "progress": 0, "request_id": request_id}
 
         # 防止并发链路复用到上一次请求的指纹上下文
         if hasattr(self.flow_client, "clear_request_fingerprint"):
@@ -1629,361 +1686,542 @@ class GenerationHandler:
             f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}..."
         )
 
-        # 向用户展示开始信息
-        if stream:
-            yield self._create_stream_chunk(
-                f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
-                role="assistant",
-            )
-            request_log_state["id"] = await self._log_request(
-                token_id=None,
-                operation=request_operation,
-                request_data=request_payload,
-                response_data={
-                    "status": "processing",
-                    "status_text": "started",
-                    "progress": 0,
-                    "request_id": request_id,
-                },
-                status_code=102,
-                duration=0,
-                status_text="started",
-                progress=0,
-            )
-
-        # 2. 选择Token
-        debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
-        token_select_started_at = time.time()
-
-        if generation_type == "image":
-            token = await self.load_balancer.select_token(
-                for_image_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        else:
-            token = await self.load_balancer.select_token(
-                for_video_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        perf_trace["token_select_ms"] = int(
-            (time.time() - token_select_started_at) * 1000
+        # 1.5 入队并按并发槽位等待执行（支持后台查看队列任务及手动取消未执行任务）
+        queue_info = await queue_manager.enqueue(
+            task_id=request_id,
+            model=model,
+            generation_type=generation_type,
+            prompt=prompt,
+            stream=stream,
+        )
+        initial_status_text = "queued" if queue_info["status"] == "queued" else "started"
+        request_log_state["id"] = await self._log_request(
+            token_id=None,
+            operation=request_operation,
+            request_data=request_payload,
+            response_data={
+                "status": "processing",
+                "status_text": initial_status_text,
+                "progress": 0,
+                "request_id": request_id,
+                "queue_position": queue_info.get("queue_position", 0),
+            },
+            status_code=102,
+            duration=0,
+            status_text=initial_status_text,
+            progress=0,
+        )
+        await queue_manager.update_task(
+            request_id,
+            log_id=request_log_state.get("id"),
         )
 
-        if not token:
-            error_msg = None
-            if self.load_balancer and hasattr(
-                self.load_balancer, "get_unavailable_reason"
-            ):
-                error_msg = await self.load_balancer.get_unavailable_reason(
-                    for_image_generation=(generation_type == "image"),
-                    for_video_generation=(generation_type == "video"),
-                    model=model,
-                )
-            if not error_msg:
-                error_msg = self._get_no_token_error_message(generation_type)
-            debug_logger.log_error(f"[GENERATION] {error_msg}")
-            record_generation_result(
-                generation_type, "no_token", time.time() - start_time
-            )
-            await self._log_request(
-                token_id=None,
-                operation=request_operation,
-                request_data=request_payload,
-                response_data={"error": error_msg, "performance": perf_trace},
-                status_code=503,
-                duration=time.time() - start_time,
-                log_id=request_log_state.get("id"),
-                status_text="failed",
-                progress=request_log_state.get("progress", 0),
-            )
-            if stream:
-                yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=503)
-            return
-
-        debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
-        pending_token_state["active"] = True
-        await self._update_request_log_progress(
-            request_log_state,
-            token_id=token.id,
-            status_text="token_selected",
-            progress=8,
-            response_extra={"token_email": token.email},
-        )
+        queue_outcome_status = "failed"
+        queue_outcome_text: Optional[str] = None
+        queue_outcome_progress: Optional[int] = None
+        queue_outcome_error: Optional[str] = None
 
         try:
-            # 3. 确保AT有效
-            debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
+            if queue_info["status"] == "queued":
+                queue_pos = queue_info.get("queue_position", 1)
+                debug_logger.log_info(
+                    f"[GENERATION] [{request_id}] 当前并发已满 ({queue_info['running_count']}/{queue_info['max_concurrency']})，进入队列等待: 第 {queue_pos} 位"
+                )
+                if stream:
+                    yield self._create_stream_chunk(
+                        f"⏳ 当前并发已满，任务已进入队列（第 {queue_pos} 位），等待执行中...\n",
+                        role="assistant",
+                    )
+
+                turn_result = await queue_manager.wait_for_turn(request_id)
+                perf_trace["queue_wait_ms"] = turn_result.get("wait_ms", 0)
+                if turn_result["status"] != "running":
+                    cancel_reason = turn_result.get("reason") or "队列任务已取消"
+                    error_msg = f"生成已取消: {cancel_reason}"
+                    status_code = 499 if turn_result["status"] == "cancelled" else 504
+                    status_text_val = "cancelled" if turn_result["status"] == "cancelled" else "failed"
+                    queue_outcome_status = status_text_val
+                    queue_outcome_text = status_text_val
+                    queue_outcome_progress = 0
+                    queue_outcome_error = error_msg
+                    debug_logger.log_warning(f"[GENERATION] [{request_id}] {error_msg}")
+                    duration = time.time() - start_time
+                    record_generation_result(generation_type, status_text_val, duration)
+                    perf_trace["status"] = status_text_val
+                    perf_trace["total_ms"] = int(duration * 1000)
+                    perf_trace["error"] = error_msg
+                    await self._log_request(
+                        token_id=None,
+                        operation=request_operation,
+                        request_data=request_payload,
+                        response_data={"error": error_msg, "performance": perf_trace},
+                        status_code=status_code,
+                        duration=duration,
+                        log_id=request_log_state.get("id"),
+                        status_text=status_text_val,
+                        progress=0,
+                    )
+                    if stream:
+                        yield self._create_stream_chunk(f"⚠️ {error_msg}\n")
+                    yield self._create_error_response(error_msg, status_code=status_code)
+                    return
+
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=None,
+                    status_text="started",
+                    progress=2,
+                )
+
+            # 向用户展示开始信息
             if stream:
-                yield self._create_stream_chunk("初始化生成环境...\n")
-
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="token_ready",
-                progress=15,
-            )
-            ensure_at_started_at = time.time()
-            token = await self.token_manager.ensure_valid_token(token)
-            perf_trace["ensure_at_ms"] = int(
-                (time.time() - ensure_at_started_at) * 1000
-            )
-            if not token:
-                error_msg = "Token AT无效或刷新失败"
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                record_generation_result(
-                    generation_type, "failed", time.time() - start_time
+                yield self._create_stream_chunk(
+                    f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
+                    role="assistant",
                 )
-                if stream:
-                    yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=503)
-                return
 
-            # 4. 确保Project存在
-            debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
-
-            if not supports_model_for_tier(model, token.user_paygate_tier):
-                required_tier = get_required_paygate_tier_for_model(model)
-                error_msg = (
-                    "当前模型需要 "
-                    + get_paygate_tier_label(required_tier)
-                    + " 账号: "
-                    + model
-                )
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                record_generation_result(
-                    generation_type, "failed", time.time() - start_time
-                )
-                if stream:
-                    yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=403)
-                return
-
-            ensure_project_started_at = time.time()
-            project_id = await self.token_manager.ensure_project_exists(token.id)
-            perf_trace["ensure_project_ms"] = int(
-                (time.time() - ensure_project_started_at) * 1000
-            )
-            debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="project_ready",
-                progress=22,
-                response_extra={"project_id": project_id},
-            )
-            prefill_action = (
-                "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
-            )
-            await self.flow_client.prefill_remote_browser_pool(
-                project_id=project_id,
-                action=prefill_action,
-                token_id=token.id,
-            )
-
-            # 5. 根据类型处理
-            generation_pipeline_started_at = time.time()
-            if generation_type == "image":
-                debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
-                    token,
-                    project_id,
-                    model_config,
-                    prompt,
-                    images,
-                    stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state,
+            # 2. 选择Token（账号配额耗尽/风控时自动切换到其他账号重试）
+            failed_token_ids: set = set()
+            last_failover_error: Optional[str] = None
+            failover_summary: List[str] = []
+            risk_failures = 0
+            for token_attempt in range(MAX_TOKEN_FAILOVER_ATTEMPTS):
+                token = None
+                generation_result = self._create_generation_result()
+                pending_token_state = {"active": False}
+                if token_attempt > 0 and hasattr(
+                    self.flow_client, "clear_request_fingerprint"
                 ):
-                    yield chunk
-            else:  # video
-                debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                async for chunk in self._handle_video_generation(
-                    token,
-                    project_id,
-                    model_config,
-                    prompt,
-                    images,
-                    stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state,
-                    video_media_id=video_media_id,
-                ):
-                    yield chunk
-            perf_trace["generation_pipeline_ms"] = int(
-                (time.time() - generation_pipeline_started_at) * 1000
-            )
+                    self.flow_client.clear_request_fingerprint()
+                # 选择本次尝试的 Token
+                debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
+                token_select_started_at = time.time()
 
-            # 6. 记录使用
-            if not generation_result.get("success"):
-                error_msg = generation_result.get("error_message") or "生成未成功完成"
-                debug_logger.log_warning(
-                    f"[GENERATION] 生成未成功，不扣次数: {error_msg}"
+                if generation_type == "image":
+                    token = await self.load_balancer.select_token(
+                        for_image_generation=True,
+                        model=model,
+                        reserve=False,
+                        enforce_concurrency_filter=False,
+                        track_pending=True,
+                        exclude_token_ids=failed_token_ids,
+                    )
+                else:
+                    token = await self.load_balancer.select_token(
+                        for_video_generation=True,
+                        model=model,
+                        reserve=False,
+                        enforce_concurrency_filter=False,
+                        track_pending=True,
+                        exclude_token_ids=failed_token_ids,
+                    )
+                perf_trace["token_select_ms"] = int(
+                    (time.time() - token_select_started_at) * 1000
                 )
-                if token:
-                    await self.token_manager.record_error(token.id)
-                duration = time.time() - start_time
-                record_generation_result(generation_type, "failed", duration)
-                perf_trace["status"] = "failed"
-                perf_trace["total_ms"] = int(duration * 1000)
-                perf_trace["error"] = error_msg
-                prompt_for_log = (
-                    prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+
+                if not token:
+                    error_msg = None
+                    if self.load_balancer and hasattr(
+                        self.load_balancer, "get_unavailable_reason"
+                    ):
+                        error_msg = await self.load_balancer.get_unavailable_reason(
+                            for_image_generation=(generation_type == "image"),
+                            for_video_generation=(generation_type == "video"),
+                            model=model,
+                        )
+                    if not error_msg:
+                        error_msg = self._get_no_token_error_message(generation_type)
+                    if last_failover_error:
+                        error_msg = (
+                            f"{last_failover_error}（已尝试 {len(failed_token_ids)} 个账号均失败: "
+                            f"{', '.join(failover_summary)}；没有其他可切换的账号）"
+                        )
+                    queue_outcome_status = "failed"
+                    queue_outcome_text = "failed"
+                    queue_outcome_error = error_msg
+                    debug_logger.log_error(f"[GENERATION] {error_msg}")
+                    record_generation_result(
+                        generation_type, "no_token", time.time() - start_time
+                    )
+                    await self._log_request(
+                        token_id=None,
+                        operation=request_operation,
+                        request_data=request_payload,
+                        response_data={"error": error_msg, "performance": perf_trace},
+                        status_code=503,
+                        duration=time.time() - start_time,
+                        log_id=request_log_state.get("id"),
+                        status_text="failed",
+                        progress=request_log_state.get("progress", 0),
+                    )
+                    if stream:
+                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
+                    yield self._create_error_response(error_msg, status_code=503)
+                    return
+
+                debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+                pending_token_state["active"] = True
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="token_selected",
+                    progress=8,
+                    response_extra={"token_email": token.email},
                 )
-                await self._log_request(
-                    token.id if token else None,
-                    request_operation,
-                    request_payload,
-                    {"error": error_msg, "performance": perf_trace},
-                    500,
-                    duration,
-                    log_id=request_log_state.get("id"),
-                    status_text="failed",
-                    progress=request_log_state.get("progress", 0),
-                )
-                if not generation_result.get("error_emitted"):
+
+                try:
+                    # 3. 确保AT有效
+                    debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
+                    if stream:
+                        yield self._create_stream_chunk("初始化生成环境...\n")
+
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="token_ready",
+                        progress=15,
+                    )
+                    ensure_at_started_at = time.time()
+                    token = await self.token_manager.ensure_valid_token(token)
+                    perf_trace["ensure_at_ms"] = int(
+                        (time.time() - ensure_at_started_at) * 1000
+                    )
+                    if not token:
+                        error_msg = "Token AT无效或刷新失败"
+                        queue_outcome_status = "failed"
+                        queue_outcome_text = "failed"
+                        queue_outcome_error = error_msg
+                        debug_logger.log_error(f"[GENERATION] {error_msg}")
+                        record_generation_result(
+                            generation_type, "failed", time.time() - start_time
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(f"错误: {error_msg}\n")
+                        yield self._create_error_response(error_msg, status_code=503)
+                        return
+
+                    # 4. 确保Project存在
+                    debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
+
+                    if not supports_model_for_tier(model, token.user_paygate_tier):
+                        required_tier = get_required_paygate_tier_for_model(model)
+                        error_msg = (
+                            "当前模型需要 "
+                            + get_paygate_tier_label(required_tier)
+                            + " 账号: "
+                            + model
+                        )
+                        queue_outcome_status = "failed"
+                        queue_outcome_text = "failed"
+                        queue_outcome_error = error_msg
+                        debug_logger.log_error(f"[GENERATION] {error_msg}")
+                        record_generation_result(
+                            generation_type, "failed", time.time() - start_time
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(f"错误: {error_msg}\n")
+                        yield self._create_error_response(error_msg, status_code=403)
+                        return
+
+                    ensure_project_started_at = time.time()
+                    project_id = await self.token_manager.ensure_project_exists(token.id)
+                    perf_trace["ensure_project_ms"] = int(
+                        (time.time() - ensure_project_started_at) * 1000
+                    )
+                    debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="project_ready",
+                        progress=22,
+                        response_extra={"project_id": project_id},
+                    )
+                    prefill_action = (
+                        "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
+                    )
+                    await self.flow_client.prefill_remote_browser_pool(
+                        project_id=project_id,
+                        action=prefill_action,
+                        token_id=token.id,
+                    )
+
+                    # 5. 根据类型处理
+                    generation_pipeline_started_at = time.time()
+                    if generation_type == "image":
+                        debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
+                        async for chunk in self._handle_image_generation(
+                            token,
+                            project_id,
+                            model_config,
+                            prompt,
+                            images,
+                            stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state,
+                        ):
+                            yield chunk
+                    else:  # video
+                        debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
+                        async for chunk in self._handle_video_generation(
+                            token,
+                            project_id,
+                            model_config,
+                            prompt,
+                            images,
+                            stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state,
+                            video_media_id=video_media_id,
+                        ):
+                            yield chunk
+                    perf_trace["generation_pipeline_ms"] = int(
+                        (time.time() - generation_pipeline_started_at) * 1000
+                    )
+
+                    # 6. 记录使用
+                    if not generation_result.get("success"):
+                        error_msg = generation_result.get("error_message") or "生成未成功完成"
+                        queue_outcome_status = "failed"
+                        queue_outcome_text = "failed"
+                        queue_outcome_progress = request_log_state.get("progress", 0)
+                        queue_outcome_error = error_msg
+                        debug_logger.log_warning(
+                            f"[GENERATION] 生成未成功，不扣次数: {error_msg}"
+                        )
+                        if token:
+                            await self.token_manager.record_error(token.id)
+                        duration = time.time() - start_time
+                        record_generation_result(generation_type, "failed", duration)
+                        perf_trace["status"] = "failed"
+                        perf_trace["total_ms"] = int(duration * 1000)
+                        perf_trace["error"] = error_msg
+                        prompt_for_log = (
+                            prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+                        )
+                        await self._log_request(
+                            token.id if token else None,
+                            request_operation,
+                            request_payload,
+                            {"error": error_msg, "performance": perf_trace},
+                            500,
+                            duration,
+                            log_id=request_log_state.get("id"),
+                            status_text="failed",
+                            progress=request_log_state.get("progress", 0),
+                        )
+                        if not generation_result.get("error_emitted"):
+                            if stream:
+                                yield self._create_stream_chunk(f"错误: {error_msg}\n")
+                            yield self._create_error_response(error_msg, status_code=500)
+                        return
+
+                    is_video = generation_type == "video"
+                    await self.token_manager.record_usage(token.id, is_video=is_video)
+
+                    # 重置错误计数 (请求成功时清空连续错误计数)
+                    await self.token_manager.record_success(token.id)
+                    self.load_balancer.clear_quota_cooldown(
+                        token.id, "video" if is_video else "image"
+                    )
+
+                    debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
+                    queue_outcome_status = "completed"
+                    queue_outcome_text = "completed"
+                    queue_outcome_progress = 100
+                    queue_outcome_error = None
+
+                    # 7. 记录成功日志
+                    duration = time.time() - start_time
+                    record_generation_result(generation_type, "success", duration)
+                    perf_trace["status"] = "success"
+                    perf_trace["total_ms"] = int(duration * 1000)
+                    # 日志中保留更完整的 prompt，避免管理页只看到过短内容
+                    prompt_for_log = (
+                        prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+                    )
+
+                    # 构建响应数据，包含生成的URL
+                    response_data = {
+                        "status": "success",
+                        "model": model,
+                        "prompt": prompt_for_log,
+                        "performance": perf_trace,
+                    }
+
+                    # 添加生成的URL（如果有）
+                    if response_state.get("url"):
+                        response_data["url"] = response_state["url"]
+                    if response_state.get("generated_assets"):
+                        response_data["generated_assets"] = response_state["generated_assets"]
+                    image_perf = (
+                        perf_trace.get("image_generation", {})
+                        if isinstance(perf_trace, dict)
+                        else {}
+                    )
+                    video_perf = (
+                        perf_trace.get("video_generation", {})
+                        if isinstance(perf_trace, dict)
+                        else {}
+                    )
+                    debug_logger.log_info(
+                        f"[PERF] [{request_id}] total={perf_trace.get('total_ms', 0)}ms, "
+                        f"select={perf_trace.get('token_select_ms', 0)}ms, "
+                        f"ensure_at={perf_trace.get('ensure_at_ms', 0)}ms, "
+                        f"project={perf_trace.get('ensure_project_ms', 0)}ms, "
+                        f"pipeline={perf_trace.get('generation_pipeline_ms', 0)}ms, "
+                        f"slot_wait={image_perf.get('slot_wait_ms', 0)}ms, "
+                        f"launch_queue={image_perf.get('launch_queue_wait_ms', 0)}ms, "
+                        f"launch_stagger={image_perf.get('launch_stagger_wait_ms', 0)}ms, "
+                        f"video_slot_wait={video_perf.get('slot_wait_ms', 0)}ms"
+                    )
+
+                    await self._log_request(
+                        token.id,
+                        request_operation,
+                        request_payload,
+                        response_data,
+                        200,
+                        duration,
+                        log_id=request_log_state.get("id"),
+                        status_text="completed",
+                        progress=100,
+                    )
+
+                except asyncio.CancelledError:
+                    error_msg = "生成已取消: 客户端连接已断开"
+                    queue_outcome_status = "cancelled"
+                    queue_outcome_text = "cancelled"
+                    queue_outcome_progress = request_log_state.get("progress", 0)
+                    queue_outcome_error = error_msg
+                    debug_logger.log_warning(f"[GENERATION] ⚠️ {error_msg}")
+                    duration = time.time() - start_time
+                    record_generation_result(
+                        generation_type or "unknown", "cancelled", duration
+                    )
+                    perf_trace["status"] = "failed"
+                    perf_trace["total_ms"] = int(duration * 1000)
+                    perf_trace["error"] = error_msg
+                    prompt_for_log = (
+                        prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+                    )
+                    await self._log_request(
+                        token.id if token else None,
+                        request_operation if generation_type else "generate_unknown",
+                        request_payload if "request_payload" in locals() else {"model": model},
+                        {"error": error_msg, "performance": perf_trace},
+                        499,
+                        duration,
+                        log_id=request_log_state.get("id"),
+                        status_text="cancelled",
+                        progress=request_log_state.get("progress", 0),
+                    )
+                    raise
+                except Exception as e:
+                    error_msg = f"生成失败: {str(e)}"
+                    debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
+                    is_quota_error = self._is_quota_exhausted_error(e)
+                    if (
+                        token
+                        and (is_quota_error or self._is_unusual_activity_error(e))
+                        # 提交结果不确定时换号可能导致重复生成
+                        and not getattr(e, "submission_uncertain", False)
+                        and not getattr(e, "outcome_unknown", False)
+                    ):
+                        scope = "image" if generation_type == "image" else "video"
+                        if is_quota_error:
+                            credits = await self._refresh_token_credits(token)
+                            self.load_balancer.mark_quota_cooldown(
+                                token.id, scope, credits=credits
+                            )
+                            failover_reason = "配额耗尽"
+                            failover_notice = "当前账号配额已用尽，正在切换其他账号重试...\n"
+                        else:
+                            risk_failures += 1
+                            self.load_balancer.mark_risk_cooldown(token.id, scope)
+                            failover_reason = "触发风控"
+                            failover_notice = "当前账号触发风控，正在切换其他账号重试...\n"
+                        failed_token_ids.add(token.id)
+                        last_failover_error = error_msg
+                        failover_summary.append(f"#{token.id} {failover_reason}")
+                        perf_trace.setdefault("token_failovers", []).append(
+                            {"token_id": token.id, "error": str(e)[:200]}
+                        )
+                        if (
+                            token_attempt < MAX_TOKEN_FAILOVER_ATTEMPTS - 1
+                            and risk_failures < MAX_RISK_FAILOVER_ATTEMPTS
+                        ):
+                            debug_logger.log_warning(
+                                f"[GENERATION] Token {token.id} {failover_reason}，切换账号重试 "
+                                f"({token_attempt + 2}/{MAX_TOKEN_FAILOVER_ATTEMPTS})"
+                            )
+                            if stream:
+                                yield self._create_stream_chunk(failover_notice)
+                            continue
+                        if len(failover_summary) > 1:
+                            error_msg = (
+                                f"{error_msg}（已尝试 {len(failed_token_ids)} 个账号均失败: "
+                                f"{', '.join(failover_summary)}）"
+                            )
+                    if token:
+                        if self._should_count_token_error(e):
+                            await self.token_manager.record_error(token.id)
+                        else:
+                            debug_logger.log_info(
+                                f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, reason={str(e)[:200]}"
+                            )
+
+                    # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
+                    duration = time.time() - start_time
+                    record_generation_result(generation_type or "unknown", "failed", duration)
+                    perf_trace["status"] = "failed"
+                    perf_trace["total_ms"] = int(duration * 1000)
+                    perf_trace["error"] = error_msg
+                    prompt_for_log = (
+                        prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+                    )
+                    queue_outcome_status = "failed"
+                    queue_outcome_text = "failed"
+                    queue_outcome_progress = request_log_state.get("progress", 0)
+                    queue_outcome_error = error_msg
+                    await self._log_request(
+                        token.id if token else None,
+                        request_operation if generation_type else "generate_unknown",
+                        request_payload if "request_payload" in locals() else {"model": model},
+                        {"error": error_msg, "performance": perf_trace},
+                        500,
+                        duration,
+                        log_id=request_log_state.get("id"),
+                        status_text="failed",
+                        progress=request_log_state.get("progress", 0),
+                    )
                     if stream:
                         yield self._create_stream_chunk(f"错误: {error_msg}\n")
                     yield self._create_error_response(error_msg, status_code=500)
-                return
+                finally:
+                    if pending_token_state.get("active") and token and self.load_balancer:
+                        await self.load_balancer.release_pending(
+                            token.id,
+                            for_image_generation=(generation_type == "image"),
+                            for_video_generation=(generation_type == "video"),
+                        )
+                        pending_token_state["active"] = False
 
-            is_video = generation_type == "video"
-            await self.token_manager.record_usage(token.id, is_video=is_video)
-
-            # 重置错误计数 (请求成功时清空连续错误计数)
-            await self.token_manager.record_success(token.id)
-
-            debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
-
-            # 7. 记录成功日志
-            duration = time.time() - start_time
-            record_generation_result(generation_type, "success", duration)
-            perf_trace["status"] = "success"
-            perf_trace["total_ms"] = int(duration * 1000)
-            # 日志中保留更完整的 prompt，避免管理页只看到过短内容
-            prompt_for_log = (
-                prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-            )
-
-            # 构建响应数据，包含生成的URL
-            response_data = {
-                "status": "success",
-                "model": model,
-                "prompt": prompt_for_log,
-                "performance": perf_trace,
-            }
-
-            # 添加生成的URL（如果有）
-            if response_state.get("url"):
-                response_data["url"] = response_state["url"]
-            if response_state.get("generated_assets"):
-                response_data["generated_assets"] = response_state["generated_assets"]
-            image_perf = (
-                perf_trace.get("image_generation", {})
-                if isinstance(perf_trace, dict)
-                else {}
-            )
-            video_perf = (
-                perf_trace.get("video_generation", {})
-                if isinstance(perf_trace, dict)
-                else {}
-            )
-            debug_logger.log_info(
-                f"[PERF] [{request_id}] total={perf_trace.get('total_ms', 0)}ms, "
-                f"select={perf_trace.get('token_select_ms', 0)}ms, "
-                f"ensure_at={perf_trace.get('ensure_at_ms', 0)}ms, "
-                f"project={perf_trace.get('ensure_project_ms', 0)}ms, "
-                f"pipeline={perf_trace.get('generation_pipeline_ms', 0)}ms, "
-                f"slot_wait={image_perf.get('slot_wait_ms', 0)}ms, "
-                f"launch_queue={image_perf.get('launch_queue_wait_ms', 0)}ms, "
-                f"launch_stagger={image_perf.get('launch_stagger_wait_ms', 0)}ms, "
-                f"video_slot_wait={video_perf.get('slot_wait_ms', 0)}ms"
-            )
-
-            await self._log_request(
-                token.id,
-                request_operation,
-                request_payload,
-                response_data,
-                200,
-                duration,
-                log_id=request_log_state.get("id"),
-                status_text="completed",
-                progress=100,
-            )
-
-        except asyncio.CancelledError:
-            error_msg = "生成已取消: 客户端连接已断开"
-            debug_logger.log_warning(f"[GENERATION] ⚠️ {error_msg}")
-            duration = time.time() - start_time
-            record_generation_result(
-                generation_type or "unknown", "cancelled", duration
-            )
-            perf_trace["status"] = "failed"
-            perf_trace["total_ms"] = int(duration * 1000)
-            perf_trace["error"] = error_msg
-            prompt_for_log = (
-                prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-            )
-            await self._log_request(
-                token.id if token else None,
-                request_operation if generation_type else "generate_unknown",
-                request_payload if "request_payload" in locals() else {"model": model},
-                {"error": error_msg, "performance": perf_trace},
-                499,
-                duration,
-                log_id=request_log_state.get("id"),
-                status_text="failed",
-                progress=request_log_state.get("progress", 0),
-            )
-            raise
-        except Exception as e:
-            error_msg = f"生成失败: {str(e)}"
-            debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
-            if token:
-                if self._should_count_token_error(e):
-                    await self.token_manager.record_error(token.id)
-                else:
-                    debug_logger.log_info(
-                        f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, reason={str(e)[:200]}"
-                    )
-
-            # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
-            duration = time.time() - start_time
-            record_generation_result(generation_type or "unknown", "failed", duration)
-            perf_trace["status"] = "failed"
-            perf_trace["total_ms"] = int(duration * 1000)
-            perf_trace["error"] = error_msg
-            prompt_for_log = (
-                prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-            )
-            await self._log_request(
-                token.id if token else None,
-                request_operation if generation_type else "generate_unknown",
-                request_payload if "request_payload" in locals() else {"model": model},
-                {"error": error_msg, "performance": perf_trace},
-                500,
-                duration,
-                log_id=request_log_state.get("id"),
-                status_text="failed",
-                progress=request_log_state.get("progress", 0),
-            )
-            if stream:
-                yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500)
+                # 本次尝试已成功或以非切换类错误结束
+                break
         finally:
+            await queue_manager.finish_task(
+                request_id,
+                status=queue_outcome_status,
+                status_text=queue_outcome_text,
+                progress=queue_outcome_progress,
+                error_message=queue_outcome_error,
+            )
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
                     token.id,
@@ -1998,6 +2236,32 @@ class GenerationHandler:
             return "没有可用的Token进行图片生成。所有Token都处于禁用、冷却、锁定或已过期状态。"
         else:
             return "没有可用的Token进行视频生成。所有Token都处于禁用、冷却、配额耗尽或已过期状态。"
+
+    @staticmethod
+    def _is_quota_exhausted_error(error: Exception) -> bool:
+        """账号配额耗尽：换一个账号通常可以成功。"""
+        return "public_error_user_quota_reached" in str(error or "").lower()
+
+    async def _refresh_token_credits(self, token) -> Optional[int]:
+        """配额耗尽后刷新并落库余额，作为冷却解除的基准；失败时退回已知余额。"""
+        try:
+            return int(
+                await asyncio.wait_for(
+                    self.token_manager.refresh_credits(token.id, raise_on_error=True),
+                    timeout=15,
+                )
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[GENERATION] 刷新 Token {token.id} 余额失败: {str(e)[:200]}"
+            )
+            credits = getattr(token, "credits", None)
+            return credits if isinstance(credits, int) else None
+
+    @staticmethod
+    def _is_unusual_activity_error(error: Exception) -> bool:
+        """账号/IP 被风控拒绝：提交被拒、未创建任务，换一个账号通常可以成功。"""
+        return "public_error_unusual_activity" in str(error or "").lower()
 
     def _should_count_token_error(self, error: Exception) -> bool:
         """判断失败是否应计入 token 连续错误。
@@ -2015,6 +2279,7 @@ class GenerationHandler:
             "recaptcha 验证失败",
             "recaptcha 错误",
             "public_error_unusual_activity",
+            "public_error_user_quota_reached",
             "too much traffic",
             "error_no_slot_available",
             "打码服务资源不足",
@@ -2739,7 +3004,7 @@ class GenerationHandler:
                     at=token.at,
                     project_id=project_id,
                     prompt=prompt,
-                    model_key=model_config.get("reference_model_key", "abra_r2v_8s"),
+                    model_key=model_config.get("reference_model_key", "macaron_cookie_r2v_8s"),
                     aspect_ratio=model_config["aspect_ratio"],
                     reference_images=reference_images,
                     user_paygate_tier=normalized_tier,
@@ -3399,11 +3664,24 @@ class GenerationHandler:
         """?????????????"""
         if not isinstance(request_log_state, dict):
             return
+        safe_progress = max(0, min(100, int(progress)))
+        req_id = request_log_state.get("request_id")
+        if req_id:
+            token_email = (
+                response_extra.get("token_email")
+                if isinstance(response_extra, dict)
+                else None
+            )
+            await queue_manager.update_task(
+                req_id,
+                status_text=status_text,
+                progress=safe_progress,
+                token_id=token_id,
+                token_email=token_email,
+            )
         log_id = request_log_state.get("id")
         if not log_id:
             return
-
-        safe_progress = max(0, min(100, int(progress)))
         now = time.time()
         last_status_text = str(request_log_state.get("last_status_text") or "").strip()
         last_progress = int(request_log_state.get("last_progress") or 0)

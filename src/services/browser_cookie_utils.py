@@ -1,4 +1,7 @@
-"""Helpers for normalizing and parsing browser cookies."""
+"""
+核心职责：浏览器与协议层 Google/Flow Cookie 解析、标准化与作用域展开工具。
+主要功能：解析 Cookie Header / JSON 数组，校验 Flow 必需登录态 Cookie，并为浏览器上下文生成兼顾 flow.google.com 与 .google.com 的 Cookie 注入目标。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ DEFAULT_COOKIE_URL = "https://flow.google.com/"
 DEFAULT_GOOGLE_COOKIE_TARGET_URLS = (
     "https://flow.google.com/",
     "https://www.google.com/",
+    "https://accounts.google.com/",
 )
 _COOKIE_ATTRIBUTE_KEYS = {
     "path",
@@ -255,22 +259,43 @@ def build_browser_cookie_targets(
                     str(item.get("url") or "").strip()
                     or str(item.get("domain") or "").strip()
                 )
-                if explicit_scope:
+                raw_domain_lower = str(item.get("domain") or "").strip().lower()
+                cookie_name = str(item.get("name") or "").strip()
+                is_synthesized_google_root_cookie = (
+                    raw_domain_lower in {"flow.google.com", "www.google.com", "accounts.google.com"}
+                    and item.get("hostOnly") is True
+                    and cookie_name not in FLOW_SESSION_COOKIE_NAMES
+                )
+                if explicit_scope and not is_synthesized_google_root_cookie:
                     append_cookie(normalized_item)
+                    continue
+                if is_synthesized_google_root_cookie:
+                    domain_cookie = dict(normalized_item)
+                    domain_cookie.pop("url", None)
+                    domain_cookie["domain"] = ".google.com"
+                    domain_cookie["path"] = str(domain_cookie.get("path") or "/").strip() or "/"
+                    append_cookie(domain_cookie)
                     continue
                 base_cookie = dict(normalized_item)
                 base_cookie.pop("domain", None)
+                base_cookie.pop("url", None)
                 base_cookie["path"] = str(base_cookie.get("path") or "/").strip() or "/"
-                for target_url in target_urls:
-                    append_cookie({**base_cookie, "url": target_url})
+                if cookie_name in FLOW_SESSION_COOKIE_NAMES:
+                    append_cookie({**base_cookie, "url": default_url})
+                else:
+                    append_cookie({**base_cookie, "domain": ".google.com"})
             return expanded
 
     for cookie in parse_browser_cookie_payload(normalized, default_url=default_url):
         base_cookie = dict(cookie)
+        cookie_name = str(base_cookie.get("name") or "").strip()
         base_cookie.pop("domain", None)
+        base_cookie.pop("url", None)
         base_cookie["path"] = str(base_cookie.get("path") or "/").strip() or "/"
-        for target_url in target_urls:
-            append_cookie({**base_cookie, "url": target_url})
+        if cookie_name in FLOW_SESSION_COOKIE_NAMES:
+            append_cookie({**base_cookie, "url": default_url})
+        else:
+            append_cookie({**base_cookie, "domain": ".google.com"})
     return expanded
 
 

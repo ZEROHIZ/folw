@@ -1,4 +1,7 @@
-"""Database storage layer for Flow2API"""
+"""
+核心职责：Flow2API SQLite 数据库存储与迁移层。
+主要功能：管理 Token、项目池、日志及各类系统配置（含验证码与 CloakBrowser 多 Key 配置）的持久化、自动迁移与内存同步。
+"""
 
 import asyncio
 import aiosqlite
@@ -165,7 +168,15 @@ class Database:
                 flow_config = config_dict.get("flow", {})
                 image_timeout = generation_config.get("image_timeout", 300)
                 video_timeout = generation_config.get("video_timeout", 1500)
+                queue_timeout = generation_config.get("queue_timeout", 1800)
                 max_retries = flow_config.get("max_retries", 3)
+            else:
+                queue_timeout = 1800
+
+            try:
+                queue_timeout = max(30, min(86400, int(queue_timeout)))
+            except Exception:
+                queue_timeout = 1800
 
             try:
                 max_retries = max(1, int(max_retries))
@@ -174,10 +185,10 @@ class Database:
 
             await db.execute(
                 """
-                INSERT INTO generation_config (id, image_timeout, video_timeout, max_retries)
-                VALUES (1, ?, ?, ?)
+                INSERT INTO generation_config (id, image_timeout, video_timeout, queue_timeout, max_retries)
+                VALUES (1, ?, ?, ?, ?)
             """,
-                (image_timeout, video_timeout, max_retries),
+                (image_timeout, video_timeout, queue_timeout, max_retries),
             )
 
         # Ensure call_logic_config has a row
@@ -478,6 +489,7 @@ class Database:
                         captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
                         twocaptcha_api_key TEXT DEFAULT '',
                         twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
+                        cloakbrowser_api_key TEXT DEFAULT '',
                         remote_browser_base_url TEXT DEFAULT '',
                         remote_browser_api_key TEXT DEFAULT '',
                         remote_browser_timeout INTEGER DEFAULT 60,
@@ -486,6 +498,7 @@ class Database:
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
                         browser_proxy_url TEXT,
                         browser_count INTEGER DEFAULT 1,
+                        browser_launch_background BOOLEAN DEFAULT 1,
                         personal_project_pool_size INTEGER DEFAULT 4,
                         personal_max_resident_tabs INTEGER DEFAULT 5,
                         browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
@@ -596,6 +609,7 @@ class Database:
             if await self._table_exists(db, "generation_config"):
                 generation_columns_to_add = [
                     ("max_retries", "INTEGER DEFAULT 3"),
+                    ("queue_timeout", "INTEGER DEFAULT 1800"),
                 ]
 
                 for col_name, col_type in generation_columns_to_add:
@@ -630,12 +644,14 @@ class Database:
                     ("capsolver_base_url", "TEXT DEFAULT 'https://api.capsolver.com'"),
                     ("twocaptcha_api_key", "TEXT DEFAULT ''"),
                     ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
+                    ("cloakbrowser_api_key", "TEXT DEFAULT ''"),
                     ("captcharun_api_key", "TEXT DEFAULT ''"),
                     (
                         "captcharun_base_url",
                         "TEXT DEFAULT 'https://api.captcha-run.com'",
                     ),
                     ("browser_count", "INTEGER DEFAULT 1"),
+                    ("browser_launch_background", "BOOLEAN DEFAULT 1"),
                     ("remote_browser_base_url", "TEXT DEFAULT ''"),
                     ("remote_browser_api_key", "TEXT DEFAULT ''"),
                     ("remote_browser_timeout", "INTEGER DEFAULT 60"),
@@ -888,6 +904,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     image_timeout INTEGER DEFAULT 300,
                     video_timeout INTEGER DEFAULT 1500,
+                    queue_timeout INTEGER DEFAULT 1800,
                     max_retries INTEGER DEFAULT 3,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -946,6 +963,7 @@ class Database:
                     captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
                     twocaptcha_api_key TEXT DEFAULT '',
                     twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
+                    cloakbrowser_api_key TEXT DEFAULT '',
                     remote_browser_base_url TEXT DEFAULT '',
                     remote_browser_api_key TEXT DEFAULT '',
                     remote_browser_timeout INTEGER DEFAULT 60,
@@ -1761,6 +1779,7 @@ class Database:
         self,
         image_timeout: Optional[int] = None,
         video_timeout: Optional[int] = None,
+        queue_timeout: Optional[int] = None,
         max_retries: Optional[int] = None,
     ):
         """Update generation configuration"""
@@ -1781,6 +1800,14 @@ class Database:
                 else current.get("video_timeout", 1500)
             )
             try:
+                normalized_queue_timeout = (
+                    max(30, min(86400, int(queue_timeout)))
+                    if queue_timeout is not None
+                    else max(30, min(86400, int(current.get("queue_timeout", 1800) or 1800)))
+                )
+            except Exception:
+                normalized_queue_timeout = 1800
+            try:
                 normalized_max_retries = (
                     max(1, int(max_retries))
                     if max_retries is not None
@@ -1793,24 +1820,26 @@ class Database:
                 await db.execute(
                     """
                     UPDATE generation_config
-                    SET image_timeout = ?, video_timeout = ?, max_retries = ?, updated_at = CURRENT_TIMESTAMP
+                    SET image_timeout = ?, video_timeout = ?, queue_timeout = ?, max_retries = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
                 """,
                     (
                         normalized_image_timeout,
                         normalized_video_timeout,
+                        normalized_queue_timeout,
                         normalized_max_retries,
                     ),
                 )
             else:
                 await db.execute(
                     """
-                    INSERT INTO generation_config (id, image_timeout, video_timeout, max_retries)
-                    VALUES (1, ?, ?, ?)
+                    INSERT INTO generation_config (id, image_timeout, video_timeout, queue_timeout, max_retries)
+                    VALUES (1, ?, ?, ?, ?)
                 """,
                     (
                         normalized_image_timeout,
                         normalized_video_timeout,
+                        normalized_queue_timeout,
                         normalized_max_retries,
                     ),
                 )
@@ -2085,6 +2114,7 @@ class Database:
         if generation_config:
             config.set_image_timeout(generation_config.image_timeout)
             config.set_video_timeout(generation_config.video_timeout)
+            config.set_queue_timeout(getattr(generation_config, "queue_timeout", 1800) or 1800)
             config.set_flow_max_retries(generation_config.max_retries)
 
         # Reload call logic config
@@ -2114,10 +2144,14 @@ class Database:
             config.set_captcharun_base_url(captcha_config.captcharun_base_url)
             config.set_twocaptcha_api_key(captcha_config.twocaptcha_api_key)
             config.set_twocaptcha_base_url(captcha_config.twocaptcha_base_url)
+            config.set_cloakbrowser_api_key(captcha_config.cloakbrowser_api_key)
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
             config.set_browser_count(captcha_config.browser_count)
+            config.set_browser_launch_background(
+                bool(getattr(captcha_config, "browser_launch_background", True))
+            )
             config.set_personal_project_pool_size(
                 captcha_config.personal_project_pool_size
             )
@@ -2300,12 +2334,14 @@ class Database:
         captcharun_base_url: str = None,
         twocaptcha_api_key: str = None,
         twocaptcha_base_url: str = None,
+        cloakbrowser_api_key: str = None,
         remote_browser_base_url: str = None,
         remote_browser_api_key: str = None,
         remote_browser_timeout: int = None,
         browser_proxy_enabled: bool = None,
         browser_proxy_url: str = None,
         browser_count: int = None,
+        browser_launch_background: bool = None,
         personal_project_pool_size: int = None,
         personal_max_resident_tabs: int = None,
         browser_personal_fresh_restart_every_n_solves: int = None,
@@ -2629,8 +2665,13 @@ class Database:
 
             # Keep the new provider update in the same transaction as the existing fields.
             previous_captcha = dict(row) if row else {}
+            new_launch_background = (
+                bool(browser_launch_background)
+                if browser_launch_background is not None
+                else bool(previous_captcha.get("browser_launch_background", True))
+            )
             await db.execute(
-                "UPDATE captcha_config SET twocaptcha_api_key = ?, twocaptcha_base_url = ? WHERE id = 1",
+                "UPDATE captcha_config SET twocaptcha_api_key = ?, twocaptcha_base_url = ?, cloakbrowser_api_key = ?, browser_launch_background = ? WHERE id = 1",
                 (
                     twocaptcha_api_key
                     if twocaptcha_api_key is not None
@@ -2638,6 +2679,10 @@ class Database:
                     twocaptcha_base_url
                     if twocaptcha_base_url is not None
                     else previous_captcha.get("twocaptcha_base_url", "https://api.2captcha.com"),
+                    cloakbrowser_api_key
+                    if cloakbrowser_api_key is not None
+                    else previous_captcha.get("cloakbrowser_api_key", ""),
+                    new_launch_background,
                 ),
             )
             await db.commit()

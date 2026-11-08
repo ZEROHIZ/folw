@@ -1,9 +1,13 @@
-"""Configuration management for Flow2API"""
+"""
+核心职责：Flow2API 全局配置管理模块。
+主要功能：加载 setting.toml 与运行时内存配置，提供打码方式（含 CloakBrowser 多 Key 解析与轮询）、代理、缓存、并发及超时等配置访问接口。
+"""
 
 import os
+import re
 import tomli
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
 YESCAPTCHA_TASK_TYPE_OPTIONS = {
@@ -41,6 +45,21 @@ def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
     if normalized in YESCAPTCHA_TASK_TYPE_OPTIONS:
         return normalized
     return DEFAULT_YESCAPTCHA_TASK_TYPE
+
+
+def parse_cloakbrowser_keys(raw: Optional[str]) -> List[str]:
+    """解析多行或逗号/分号分隔的 CloakBrowser License Key 列表（去重保序）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    keys: List[str] = []
+    seen = set()
+    for part in re.split(r"[\r\n,;，；\s]+", text):
+        cleaned = part.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            keys.append(cleaned)
+    return keys
 
 
 def get_yescaptcha_min_score(task_type: Optional[str]) -> Optional[float]:
@@ -336,6 +355,25 @@ class Config:
         if "generation" not in self._config:
             self._config["generation"] = {}
         self._config["generation"]["video_timeout"] = timeout
+
+    @property
+    def queue_timeout(self) -> int:
+        """Get generation queue wait timeout in seconds"""
+        value = self._config.get("generation", {}).get("queue_timeout", 1800)
+        try:
+            return max(30, min(86400, int(value)))
+        except Exception:
+            return 1800
+
+    def set_queue_timeout(self, timeout: int):
+        """Set generation queue wait timeout in seconds"""
+        if "generation" not in self._config:
+            self._config["generation"] = {}
+        try:
+            normalized = max(30, min(86400, int(timeout)))
+        except Exception:
+            normalized = 1800
+        self._config["generation"]["queue_timeout"] = normalized
 
     @property
     def polling_mode_enabled(self) -> bool:
@@ -751,6 +789,22 @@ class Config:
 
     def set_twocaptcha_base_url(self, base_url: str):
         self._config.setdefault("captcha", {})["twocaptcha_base_url"] = base_url
+
+    @property
+    def cloakbrowser_api_key(self) -> str:
+        """获取 CloakBrowser License Key 原始配置文本（支持换行/逗号分隔多个 Key）。"""
+        return self._config.get("captcha", {}).get("cloakbrowser_api_key", "")
+
+    def set_cloakbrowser_api_key(self, api_key: str):
+        """设置 CloakBrowser License Key 原始配置文本。"""
+        keys = parse_cloakbrowser_keys(api_key)
+        normalized = "\n".join(keys)
+        self._config.setdefault("captcha", {})["cloakbrowser_api_key"] = normalized
+
+    @property
+    def cloakbrowser_keys(self) -> List[str]:
+        """获取解析后的 CloakBrowser License Key 列表。"""
+        return parse_cloakbrowser_keys(self.cloakbrowser_api_key)
 
     @property
     def remote_browser_base_url(self) -> str:

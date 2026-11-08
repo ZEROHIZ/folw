@@ -1,4 +1,7 @@
-"""Token manager for Flow2API with AT auto-refresh"""
+"""
+核心职责：Flow2API Token 生命周期与登录态刷新管理器。
+主要功能：管理 Google/Flow Cookie 验证、AT/ST 自动续期、项目池轮换、额度刷新以及协议/浏览器（含 CloakBrowser）双通道保活。
+"""
 
 import asyncio
 import hashlib
@@ -1163,32 +1166,34 @@ class TokenManager:
             return None
 
     async def _try_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
-        """Refresh full current-Flow Cookies, with an account-bound browser fallback."""
+        """Refresh full current-Flow Cookies, with an account-bound browser primary channel."""
+        # 当使用真实浏览器/CloakBrowser 打码时，优先通过常驻浏览器触发 accounts.google.com 被动 SSO
+        # 与页面内 RotateCookies 滚动续期 __Secure-1PSIDTS / OSID，防止纯 HTTP 刷新跳过 __Secure-1PSIDTS 导致 1 小时后过期。
+        browser_refresh_error: Optional[str] = None
+        if config.captcha_method in {"personal", "browser", "cloakbrowser"}:
+            try:
+                if config.captcha_method == "personal":
+                    from .browser_captcha_personal import BrowserCaptchaService
+                else:
+                    from .browser_captcha import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
+                result = await asyncio.wait_for(
+                    service.refresh_google_cookies(token.current_project_id, token_id=token_id),
+                    timeout=55.0,
+                )
+                return await self._save_refreshed_cookies(token_id, token, result)
+            except Exception as exc:
+                browser_refresh_error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                debug_logger.log_warning(
+                    f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新未成功，回退协议刷新 - {browser_refresh_error}"
+                )
+
         refreshed = await self._try_protocol_refresh_st(token_id, token)
         if refreshed:
             return refreshed
-        latest = await self.db.get_token(token_id)
-        if not latest or latest.google_cookies != token.google_cookies:
-            # A plugin or another request has supplied a newer Cookie jar.
-            return None
-        if config.captcha_method not in {"personal", "browser"}:
-            return None
-        try:
-            if config.captcha_method == "personal":
-                from .browser_captcha_personal import BrowserCaptchaService
-            else:
-                from .browser_captcha import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
-            result = await asyncio.wait_for(
-                service.refresh_google_cookies(token.current_project_id, token_id=token_id),
-                timeout=45.0,
-            )
-            return await self._save_refreshed_cookies(token_id, token, result)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            await self._record_cookie_refresh_failure(token, error)
-            debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}")
-            return None
+        if browser_refresh_error:
+            await self._record_cookie_refresh_failure(token, browser_refresh_error)
+        return None
 
     async def refresh_cookies(self, token_id: int) -> bool:
         """Explicitly renew current-Flow Cookies even when the AT marker is valid."""
@@ -1437,19 +1442,26 @@ class TokenManager:
 
     # ========== 余额刷新 ==========
 
-    async def refresh_credits(self, token_id: int) -> int:
+    async def refresh_credits(self, token_id: int, *, raise_on_error: bool = False) -> int:
         """刷新Token余额
+
+        Args:
+            raise_on_error: 刷新失败时抛出异常，避免将失败误认为真实零余额。
 
         Returns:
             credits
         """
         token = await self.db.get_token(token_id)
         if not token:
+            if raise_on_error:
+                raise ValueError("Token not found")
             return 0
 
         # 确保AT有效
         token = await self.ensure_valid_token(token)
         if not token:
+            if raise_on_error:
+                raise ValueError("Token validation failed")
             return 0
 
         try:
@@ -1473,4 +1485,6 @@ class TokenManager:
             debug_logger.log_error(
                 f"Failed to refresh credits for token {token_id}: {str(e)}"
             )
+            if raise_on_error:
+                raise
             return 0

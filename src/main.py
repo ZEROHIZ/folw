@@ -1,4 +1,7 @@
-"""FastAPI application initialization"""
+"""
+核心职责：Flow2API FastAPI 应用入口与生命周期初始化。
+主要功能：挂载路由与静态资源，启动数据库、打码服务（Personal / Browser / CloakBrowser / RemoteBrowser）、并发控制与后台自动刷新任务。
+"""
 
 import asyncio
 import os
@@ -179,12 +182,12 @@ async def lifespan(app: FastAPI):
             # 没有任何可用 token 时，打开登录窗口供用户手动操作
             await browser_service.open_login_window()
             print("No active token found, opened login window for manual setup")
-    elif captcha_config.captcha_method == "browser":
+    elif captcha_config.captcha_method in {"browser", "cloakbrowser"}:
         from .services.browser_captcha import BrowserCaptchaService
 
         browser_service = await BrowserCaptchaService.get_instance(db)
         await browser_service.warmup_browser_slots()
-        print("Browser captcha service initialized (headed mode)")
+        print(f"Browser captcha service initialized ({captcha_config.captcha_method} mode)")
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)

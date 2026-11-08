@@ -1,4 +1,7 @@
-"""Browser runtime preparation status helpers."""
+"""
+核心职责：浏览器打码运行环境（Browser / CloakBrowser / Personal）准备状态追踪模块。
+主要功能：维护各类型浏览器环境初始化、下载、预热进度与就绪状态的线程安全内存快照。
+"""
 
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ _DEFAULT_STATUS = {
 }
 _RUNTIME_STATUS: Dict[str, Dict[str, Any]] = {
     "browser": dict(_DEFAULT_STATUS),
+    "cloakbrowser": dict(_DEFAULT_STATUS),
     "personal": dict(_DEFAULT_STATUS),
 }
 
@@ -37,14 +41,17 @@ def _normalize_runtime_kind(runtime_kind: str) -> str:
 
 def _update_status(runtime_kind: str, **fields: Any) -> Dict[str, Any]:
     kind = _normalize_runtime_kind(runtime_kind)
+    now_iso = _now_iso()
+    target_kinds = ("browser", "cloakbrowser") if kind in {"browser", "cloakbrowser"} else (kind,)
     with _STATUS_LOCK:
-        status = _RUNTIME_STATUS[kind]
-        status.update(fields)
-        status["updated_at"] = _now_iso()
-        status["sequence"] = int(status.get("sequence", 0) or 0) + 1
-        if status.get("state") == "ready":
-            status["last_completed_at"] = status["updated_at"]
-        return deepcopy(status)
+        for k in target_kinds:
+            status = _RUNTIME_STATUS[k]
+            status.update(fields)
+            status["updated_at"] = now_iso
+            status["sequence"] = int(status.get("sequence", 0) or 0) + 1
+            if status.get("state") == "ready":
+                status["last_completed_at"] = now_iso
+        return deepcopy(_RUNTIME_STATUS[kind])
 
 
 def start_runtime_prepare(runtime_kind: str, message: str) -> Dict[str, Any]:

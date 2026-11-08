@@ -1,4 +1,7 @@
-"""Flow API Client for VideoFX (Veo)"""
+"""
+核心职责：Flow (VideoFX / Veo / ImageFX) 核心上游客户端。
+主要功能：封装图片与视频生成、项目池管理、reCAPTCHA 多种打码通道（含 CloakBrowser / 有头浏览器 / 内置浏览器 / 第三方 API）调度及请求重试机制。
+"""
 
 import asyncio
 import json
@@ -1294,7 +1297,7 @@ class _FlowClientBase(FlowFrontendMixin):
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                if config.captcha_method == "browser" and project_id:
+                if config.captcha_method in {"browser", "cloakbrowser"} and project_id:
                     from .browser_captcha import BrowserCaptchaService
 
                     service = await BrowserCaptchaService.get_instance(self.db)
@@ -3126,7 +3129,7 @@ class _FlowClientBase(FlowFrontendMixin):
         )
         headers["Accept"] = "text/event-stream, text/event-stream"
 
-        if config.captcha_method == "browser" and project_id:
+        if config.captcha_method in {"browser", "cloakbrowser"} and project_id:
             from .browser_captcha import BrowserCaptchaService
 
             service = await BrowserCaptchaService.get_instance(self.db)
@@ -3192,8 +3195,8 @@ class _FlowClientBase(FlowFrontendMixin):
         prompt: str,
         aspect_ratio: str,
         reference_media_ids: List[str],
-        model_usage_key: str = "abra_r2v_10s",
-        model_display_name: str = "Omni Flash",
+        model_usage_key: str = "macaron_cookie_r2v_10s",
+        model_display_name: str = "Omni 1.2 Flash",
         duration: int = 10,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
@@ -4590,7 +4593,7 @@ class _FlowClientBase(FlowFrontendMixin):
             not defer_browser_error_notification
             or not retry_reason
             or is_terminal_attempt
-            or (config.captcha_method == "browser" and "recaptcha" in error_str.lower())
+            or (config.captcha_method in {"browser", "cloakbrowser"} and "recaptcha" in error_str.lower())
         )
 
         if should_notify_browser:
@@ -4709,6 +4712,9 @@ class _FlowClientBase(FlowFrontendMixin):
         if "model_access_denied" in error_lower:
             # 账号无对应模型权限，重试不会改变结果
             return None
+        if "public_error_user_quota_reached" in error_lower:
+            # 账号额度不足，同号重试只会白白消耗打码；交给上层换号
+            return None
         if "403" in error_lower:
             return "403错误"
         if "429" in error_lower or "too many requests" in error_lower:
@@ -4748,6 +4754,9 @@ class _FlowClientBase(FlowFrontendMixin):
             return 2
         if "recaptcha" in error_lower:
             return 2
+        if "public_error_unusual_activity" in error_lower:
+            # 风控拒绝后立刻重试几乎必然再次被拒，留出打码服务自愈时间
+            return 3
         return 1
 
     def _resolve_recaptcha_runtime_settings(
@@ -4836,7 +4845,7 @@ class _FlowClientBase(FlowFrontendMixin):
         if context.get("browser_ref") != browser_id or context.get("project_id") != project_id:
             context = {}
         method = context.get("method") or config.captcha_method
-        if method == "browser":
+        if method in {"browser", "cloakbrowser"}:
             try:
                 from .browser_captcha import BrowserCaptchaService
 
@@ -4899,7 +4908,7 @@ class _FlowClientBase(FlowFrontendMixin):
         context = self._get_captcha_request_context()
         method = context.get("method") if context.get("browser_ref") == browser_id else None
         method = method or config.captcha_method
-        if method == "browser":
+        if method in {"browser", "cloakbrowser"}:
             try:
                 from .browser_captcha import BrowserCaptchaService
 
@@ -5202,7 +5211,7 @@ class _FlowClientBase(FlowFrontendMixin):
         """
         captcha_method = method_override or config.captcha_method
         previous = self._get_captcha_request_context()
-        if previous.get("method") == "browser" and previous.get("owner") is asyncio.current_task():
+        if previous.get("method") in {"browser", "cloakbrowser"} and previous.get("owner") is asyncio.current_task():
             await self._notify_browser_captcha_request_finished(previous.get("browser_ref"))
         self._set_captcha_request_context({
             "method": captcha_method, "token_id": token_id, "project_id": project_id,
@@ -5352,8 +5361,8 @@ class _FlowClientBase(FlowFrontendMixin):
                 debug_logger.log_error(f"[reCAPTCHA Personal] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
                 return None, None
-        # 有头浏览器打码 (playwright)
-        elif captcha_method == "browser":
+        # 有头浏览器 / CloakBrowser 打码 (playwright)
+        elif captcha_method in {"browser", "cloakbrowser"}:
             try:
                 from .browser_captcha import BrowserCaptchaService
 
@@ -5370,7 +5379,7 @@ class _FlowClientBase(FlowFrontendMixin):
                 self._set_request_fingerprint(fingerprint if token else None)
                 if token:
                     self._set_captcha_request_context({
-                        "method": "browser", "browser_ref": browser_id,
+                        "method": captcha_method, "browser_ref": browser_id,
                         "token_id": token_id, "project_id": project_id,
                         "owner": asyncio.current_task(),
                     })

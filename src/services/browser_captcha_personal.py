@@ -1,7 +1,7 @@
 """
 核心职责：Personal 模式内置浏览器 reCAPTCHA 打码与常驻标签页池管理服务。
 主要功能：
-1. 使用 nodriver 启动并维护无头/有头浏览器实例与全局共享常驻标签页池；
+1. 使用 nodriver 启动并维护无头/有头浏览器实例与全局共享常驻标签页池（优先探测虚拟环境内 CloakBrowser Pro 内核）；
 2. 负责 Token 级 Google/Flow Cookie 隔离注入、作用域保持与会话状态回填；
 3. 注入并执行 Flow 站点 trusted reCAPTCHA / 原生 harvest 取码与浏览器指纹同步。
 """
@@ -625,7 +625,7 @@ def _detect_real_browser_executable_path() -> Optional[str]:
 
 
 def _resolve_browser_executable_path() -> tuple[Optional[str], str]:
-    """解析浏览器优先级：环境变量 > auto。"""
+    """解析浏览器优先级：环境变量 > CloakBrowser Pro > auto。"""
     browser_executable_path = (
         os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
     )
@@ -639,6 +639,25 @@ def _resolve_browser_executable_path() -> tuple[Optional[str], str]:
         normalized = os.path.normpath(browser_executable_path)
         debug_logger.log_info(f"[BrowserCaptcha] 使用环境变量指定浏览器: {normalized}")
         return normalized, "configured"
+
+    try:
+        from cloakbrowser.config import get_binary_path, get_effective_version
+        from cloakbrowser.license import resolve_license_key
+
+        key = resolve_license_key()
+        if key:
+            os.environ.setdefault("CLOAKBROWSER_LICENSE_KEY", key)
+        version = get_effective_version()
+        if version:
+            binary_path = get_binary_path(version)
+            if binary_path and binary_path.exists():
+                normalized = os.path.normpath(str(binary_path))
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 自动使用虚拟环境内 CloakBrowser Pro 内核: {normalized}"
+                )
+                return normalized, "configured"
+    except Exception:
+        pass
 
     return None, "auto"
 
@@ -700,9 +719,16 @@ def _build_personal_browser_args(
         "--no-zygote",
     ]
 
+    launch_in_background = bool(getattr(config, "browser_launch_background", True))
     if headless:
         browser_args.append("--no-startup-window")
         browser_args.append("--window-position=3000,3000")
+    elif launch_in_background:
+        browser_args.append("--start-minimized")
+        if sys.platform.startswith("win"):
+            browser_args.append("--window-position=-32000,-32000")
+        else:
+            browser_args.append("--window-position=3000,3000")
     else:
         browser_args.append("--window-position=80,80")
 

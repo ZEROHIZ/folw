@@ -1,4 +1,7 @@
-"""Validate exported Google cookies against the current Flow frontend."""
+"""
+核心职责：协议层 Google/Flow Cookie 登录态校验与会话刷新工具。
+主要功能：构建规范化作用域（区分 flow.google.com 与 .google.com）的 CookieJar，请求 Flow 前端验证登录账号并提取更新后的 Cookie。
+"""
 
 import hashlib
 import json
@@ -57,6 +60,15 @@ def _cookie_jar(raw: str) -> CookieJar:
             continue
         expires = item.get("expires")
         expires = int(expires) if expires and expires > 0 else None
+        cookie_name = str(item.get("name") or "").strip()
+        is_flow_host_only = cookie_name in {"OSID", "__Secure-OSID"} or (
+            domain == "flow.google.com"
+            and bool(item.get("domain"))
+            and not domain.startswith(".")
+            and item.get("hostOnly") is False
+        )
+        if not is_flow_host_only and domain in {"flow.google.com", "www.google.com", "accounts.google.com", "google.com"}:
+            domain = ".google.com"
         rest = {}
         if item.get("httpOnly"):
             rest["HttpOnly"] = None
@@ -70,7 +82,7 @@ def _cookie_jar(raw: str) -> CookieJar:
                 port=None,
                 port_specified=False,
                 domain=domain,
-                domain_specified=bool(item.get("domain")),
+                domain_specified=domain.startswith(".") or bool(item.get("domain")),
                 domain_initial_dot=domain.startswith("."),
                 path=item.get("path", "/"),
                 path_specified=True,

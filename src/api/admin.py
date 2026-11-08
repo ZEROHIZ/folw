@@ -1,4 +1,7 @@
-"""Admin API routes"""
+"""
+核心职责：Flow2API 管理后台 API 路由层。
+主要功能：提供管理员认证、Token 增删改查与刷新、代理测试、验证码配置（含 CloakBrowser 多 Key 管理）、运行状态监控及分数测试接口。
+"""
 
 import asyncio
 import hashlib
@@ -25,6 +28,7 @@ from ..core.config import (
     normalize_captcha_method,
     normalize_yescaptcha_task_type,
     is_yes_style_captcha_method,
+    parse_cloakbrowser_keys,
     FLOW2API_TEAM_CAPTCHA_BASE_URL,
     FLOW2API_TEAM_CAPTCHA_CLIENT_KEY,
     FLOW2API_TEAM_CAPTCHA_METHOD,
@@ -42,6 +46,7 @@ from ..core.monitoring import build_public_health_snapshot
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+from ..services.queue_manager import queue_manager
 
 try:
     import httpx
@@ -204,7 +209,7 @@ def _validate_browser_proxy_url_local(proxy_url: str) -> tuple[bool, Optional[st
 
 def _normalize_runtime_method(method: Optional[str]) -> str:
     normalized = (method or "").strip().lower()
-    if normalized not in {"browser", "personal"}:
+    if normalized not in {"browser", "cloakbrowser", "personal"}:
         raise HTTPException(status_code=400, detail="Invalid runtime method")
     return normalized
 
@@ -212,7 +217,12 @@ def _normalize_runtime_method(method: Optional[str]) -> str:
 async def _prepare_captcha_runtime(method: str):
     runtime_method = _normalize_runtime_method(method)
     try:
-        if runtime_method == "browser":
+        if runtime_method == "cloakbrowser":
+            start_runtime_prepare(
+                runtime_method,
+                "已开始准备 CloakBrowser 打码运行环境，安装进度将自动显示。",
+            )
+        elif runtime_method == "browser":
             start_runtime_prepare(
                 runtime_method,
                 "已开始准备有头浏览器打码运行环境，安装进度将自动显示。",
@@ -223,7 +233,7 @@ async def _prepare_captcha_runtime(method: str):
                 "已开始准备内置浏览器打码运行环境，安装进度将自动显示。",
             )
 
-        if runtime_method == "browser":
+        if runtime_method in {"browser", "cloakbrowser"}:
             module = await asyncio.to_thread(
                 importlib.import_module, "src.services.browser_captcha"
             )
@@ -235,7 +245,9 @@ async def _prepare_captcha_runtime(method: str):
                 await service.warmup_browser_slots()
             finish_runtime_prepare(
                 runtime_method,
-                "Chromium 浏览器环境已就绪，可以开始使用有头浏览器打码。",
+                "CloakBrowser 浏览器环境已就绪，可以开始使用 CloakBrowser 打码。"
+                if runtime_method == "cloakbrowser"
+                else "Chromium 浏览器环境已就绪，可以开始使用有头浏览器打码。",
             )
             return
 
@@ -435,7 +447,7 @@ async def _resolve_score_test_verify_proxy(
     """
     # 浏览器打码模式优先使用 browser_proxy，确保与取 token 出口一致
     if (
-        captcha_method in {"browser", "personal"}
+        captcha_method in {"browser", "cloakbrowser", "personal"}
         and browser_proxy_enabled
         and browser_proxy_url
     ):
@@ -790,6 +802,7 @@ class CaptchaScoreTestRequest(BaseModel):
 class GenerationConfigRequest(BaseModel):
     image_timeout: Optional[int] = None
     video_timeout: Optional[int] = None
+    queue_timeout: Optional[int] = None
     max_retries: Optional[int] = None
 
 
@@ -1040,7 +1053,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "at_expiring_within_1h": bool(
             normalize_dt(row.get("at_expires"))
             and normalize_dt(row.get("at_expires")) > now
-            and (normalize_dt(row.get("at_expires")) - now).total_seconds() < 3600
+            and (normalize_dt(row.get("at_expires")) - now).total_seconds() < 900
         ),
         "token": row.get("at"),  # 兼容前端 token.token 的访问方式
         "email": row.get("email"),
@@ -1606,13 +1619,14 @@ async def test_proxy_connectivity(
 @router.get("/api/config/generation")
 async def get_generation_config(token: str = Depends(verify_admin_token)):
     """Get generation timeout configuration"""
-    config = await db.get_generation_config()
+    gen_config = await db.get_generation_config()
     return {
         "success": True,
         "config": {
-            "image_timeout": config.image_timeout,
-            "video_timeout": config.video_timeout,
-            "max_retries": config.max_retries,
+            "image_timeout": gen_config.image_timeout,
+            "video_timeout": gen_config.video_timeout,
+            "queue_timeout": getattr(gen_config, "queue_timeout", 1800) or 1800,
+            "max_retries": gen_config.max_retries,
         },
     }
 
@@ -1625,6 +1639,7 @@ async def update_generation_config(
     await db.update_generation_config(
         image_timeout=request.image_timeout,
         video_timeout=request.video_timeout,
+        queue_timeout=request.queue_timeout,
         max_retries=request.max_retries,
     )
 
@@ -1884,6 +1899,7 @@ async def update_generation_timeout(
     await db.update_generation_config(
         image_timeout=request.image_timeout,
         video_timeout=request.video_timeout,
+        queue_timeout=request.queue_timeout,
         max_retries=request.max_retries,
     )
 
@@ -2055,6 +2071,19 @@ async def update_captcha_config(
     captcharun_base_url = request.get("captcharun_base_url")
     twocaptcha_api_key = request.get("twocaptcha_api_key")
     twocaptcha_base_url = request.get("twocaptcha_base_url")
+    cloakbrowser_api_key = request.get("cloakbrowser_api_key")
+    if cloakbrowser_api_key is not None and not isinstance(cloakbrowser_api_key, str):
+        return {"success": False, "message": "CloakBrowser License Key 必须是字符串"}
+    if cloakbrowser_api_key is not None:
+        parsed_cb_keys = parse_cloakbrowser_keys(cloakbrowser_api_key)
+        cloakbrowser_api_key = "\n".join(parsed_cb_keys)
+        if parsed_cb_keys:
+            try:
+                from cloakbrowser.license import save_license_key
+
+                save_license_key(parsed_cb_keys[0])
+            except Exception:
+                pass
     if twocaptcha_api_key is not None and not isinstance(twocaptcha_api_key, str):
         return {"success": False, "message": "2Captcha API Key 必须是字符串"}
     if twocaptcha_base_url is not None:
@@ -2070,6 +2099,7 @@ async def update_captcha_config(
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
+    browser_launch_background = bool(request.get("browser_launch_background", True))
     personal_project_pool_size = request.get("personal_project_pool_size")
     personal_max_resident_tabs = request.get("personal_max_resident_tabs")
     browser_personal_fresh_restart_every_n_solves = request.get(
@@ -2137,12 +2167,14 @@ async def update_captcha_config(
         captcharun_base_url=captcharun_base_url,
         twocaptcha_api_key=twocaptcha_api_key,
         twocaptcha_base_url=twocaptcha_base_url,
+        cloakbrowser_api_key=cloakbrowser_api_key,
         remote_browser_base_url=remote_browser_base_url,
         remote_browser_api_key=remote_browser_api_key,
         remote_browser_timeout=remote_browser_timeout,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
         browser_count=browser_count,
+        browser_launch_background=browser_launch_background,
         personal_project_pool_size=personal_project_pool_size,
         personal_max_resident_tabs=personal_max_resident_tabs,
         browser_personal_fresh_restart_every_n_solves=browser_personal_fresh_restart_every_n_solves,
@@ -2156,10 +2188,14 @@ async def update_captcha_config(
     runtime_prepare_message = ""
     runtime_status_method = None
 
-    if captcha_method in {"browser", "personal"}:
+    if captcha_method in {"browser", "cloakbrowser", "personal"}:
         runtime_status_method = captcha_method
         runtime_prepare_started = _schedule_captcha_runtime_prepare(captcha_method)
-        if captcha_method == "browser":
+        if captcha_method == "cloakbrowser":
+            runtime_prepare_message = (
+                "已开始准备 CloakBrowser 打码运行环境，安装进度将自动显示。"
+            )
+        elif captcha_method == "browser":
             runtime_prepare_message = (
                 "已开始准备有头浏览器打码运行环境，安装进度将自动显示。"
             )
@@ -2212,12 +2248,16 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "captcharun_base_url": captcha_config.captcharun_base_url,
         "twocaptcha_api_key": captcha_config.twocaptcha_api_key,
         "twocaptcha_base_url": captcha_config.twocaptcha_base_url,
+        "cloakbrowser_api_key": captcha_config.cloakbrowser_api_key,
         "remote_browser_base_url": captcha_config.remote_browser_base_url,
         "remote_browser_api_key": captcha_config.remote_browser_api_key,
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
         "browser_count": captcha_config.browser_count,
+        "browser_launch_background": bool(
+            getattr(captcha_config, "browser_launch_background", True)
+        ),
         "personal_project_pool_size": captcha_config.personal_project_pool_size,
         "personal_max_resident_tabs": captcha_config.personal_max_resident_tabs,
         "browser_personal_fresh_restart_every_n_solves": captcha_config.browser_personal_fresh_restart_every_n_solves,
@@ -2228,13 +2268,13 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
 @router.get("/api/captcha/browser-stats")
 async def get_browser_captcha_stats(token: str = Depends(verify_admin_token)):
     """Inspect existing browser slots without starting a browser runtime."""
-    if config.captcha_method != "browser":
+    if config.captcha_method not in {"browser", "cloakbrowser"}:
         return {"captcha_method": config.captcha_method, "running": False, "browsers": []}
     module = sys.modules.get("src.services.browser_captcha")
     service = module.BrowserCaptchaService._instance if module else None
     if service is None:
-        return {"captcha_method": "browser", "running": False, "browsers": []}
-    return {"captcha_method": "browser", "running": not service._closed, **service.get_stats()}
+        return {"captcha_method": config.captcha_method, "running": False, "browsers": []}
+    return {"captcha_method": config.captcha_method, "running": not service._closed, **service.get_stats()}
 
 
 @router.post("/api/captcha/score-test")
@@ -2273,12 +2313,12 @@ async def test_captcha_score(
     verify_proxy_source = "none"
     verify_proxy_url = ""
     verify_impersonate = "chrome120"
-    page_verify_only = captcha_method in {"browser", "personal", "remote_browser"}
+    page_verify_only = captcha_method in {"browser", "cloakbrowser", "personal", "remote_browser"}
     verify_mode = "browser_page" if page_verify_only else "server_post"
 
     try:
         token_start = time.time()
-        if captcha_method == "browser":
+        if captcha_method in {"browser", "cloakbrowser"}:
             from ..services.browser_captcha import BrowserCaptchaService
 
             service = await BrowserCaptchaService.get_instance(db)
@@ -2887,3 +2927,34 @@ async def plugin_check_tokens(
         )
 
     return {"success": True, "tokens": tokens}
+
+
+# ========== Queue Tasks Management ==========
+
+
+@router.get("/api/queue/tasks")
+async def get_queue_tasks(token: str = Depends(verify_admin_token)):
+    """获取当前排队任务、正在执行任务及近期历史任务快照"""
+    return await queue_manager.get_snapshot(include_history=True)
+
+
+@router.post("/api/queue/{task_id}/cancel")
+async def cancel_queued_task(
+    task_id: str,
+    token: str = Depends(verify_admin_token),
+):
+    """手动取消尚未开始执行的排队任务"""
+    return await queue_manager.cancel_task(task_id, reason="管理员在后台手动取消排队任务")
+
+
+@router.post("/api/queue/cancel-all")
+async def cancel_all_queued_tasks(token: str = Depends(verify_admin_token)):
+    """一键取消所有排队中的待执行任务"""
+    return await queue_manager.cancel_all_queued(reason="管理员在后台批量取消排队任务")
+
+
+@router.delete("/api/queue/history")
+async def clear_queue_history(token: str = Depends(verify_admin_token)):
+    """清理已完成/已取消的历史队列记录"""
+    return await queue_manager.clear_history()
+

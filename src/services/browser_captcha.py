@@ -1,6 +1,9 @@
 """
-基于 RT 的本地 reCAPTCHA 打码服务 (终极闭环版 - 无 fake_useragent 纯净版)
-支持：自动刷新 Session Token、外部触发指纹切换、死磕重试
+核心职责：基于 Playwright 的本地有头浏览器 reCAPTCHA 打码与常驻会话管理服务。
+主要功能：
+1. 管理 Token 级/共享级有头浏览器实例（优先自动发现并集成 CloakBrowser Pro 内核与授权 Key）；
+2. 执行 Flow 页面预热、环境指纹对齐与 trusted reCAPTCHA / UI harvest 取码；
+3. 支持自动刷新 Session Token、代理注入与异常自愈重试。
 """
 
 import os
@@ -182,8 +185,95 @@ def _ensure_playwright_installed() -> bool:
     return False
 
 
+def _resolve_cloakbrowser_license_keys() -> List[str]:
+    """获取所有可用的 CloakBrowser License Key 列表（优先读取后台配置的多 Key，其次本地 license.key / 环境变量）。"""
+    keys: List[str] = []
+    seen = set()
+    try:
+        for k in getattr(config, "cloakbrowser_keys", []) or []:
+            cleaned = str(k or "").strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                keys.append(cleaned)
+    except Exception:
+        pass
+
+    if not keys:
+        try:
+            from cloakbrowser.license import resolve_license_key
+
+            fallback_key = str(resolve_license_key() or "").strip()
+            if fallback_key and fallback_key not in seen:
+                seen.add(fallback_key)
+                keys.append(fallback_key)
+        except Exception:
+            pass
+
+    env_key = os.environ.get("CLOAKBROWSER_LICENSE_KEY", "").strip()
+    if env_key and env_key not in seen:
+        seen.add(env_key)
+        keys.append(env_key)
+    return keys
+
+
+def _select_cloakbrowser_key_for_slot(
+    slot_id: Union[int, str], rotation_offset: int = 0
+) -> Tuple[Optional[str], int, int]:
+    """按浏览器槽位索引与轮换偏移分配 CloakBrowser License Key。"""
+    keys = _resolve_cloakbrowser_license_keys()
+    if not keys:
+        return None, 0, 0
+    try:
+        slot_num = int(re.sub(r"\D+", "", str(slot_id)) or "0")
+    except Exception:
+        slot_num = 0
+    idx = (slot_num + max(0, int(rotation_offset))) % len(keys)
+    return keys[idx], idx + 1, len(keys)
+
+
+def _mask_cloakbrowser_key(key: Optional[str]) -> str:
+    raw = str(key or "").strip()
+    if not raw:
+        return "<empty>"
+    if len(raw) <= 12:
+        return raw
+    return f"{raw[:7]}...{raw[-4:]}"
+
+
+def _resolve_cloakbrowser_executable() -> Optional[str]:
+    """优先探测虚拟环境内的 CloakBrowser Pro 内核，并自动注入 License Key。"""
+    try:
+        from cloakbrowser.config import get_binary_path, get_effective_version
+
+        keys = _resolve_cloakbrowser_license_keys()
+        if keys:
+            os.environ["CLOAKBROWSER_LICENSE_KEY"] = keys[0]
+        version = get_effective_version()
+        if version:
+            binary_path = get_binary_path(version)
+            if binary_path and binary_path.exists():
+                return str(binary_path)
+    except Exception:
+        pass
+    return None
+
+
 def _ensure_browser_installed() -> bool:
     """确保 chromium 浏览器已安装"""
+    custom_executable = (
+        os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
+        or _resolve_cloakbrowser_executable()
+        or ""
+    )
+    if custom_executable and os.path.exists(custom_executable):
+        debug_logger.log_info(
+            f"[BrowserCaptcha] 检测到已配置的自定义/CloakBrowser 浏览器: {custom_executable}"
+        )
+        finish_runtime_prepare(
+            "browser", "检测到 CloakBrowser 浏览器已安装，正在准备实例..."
+        )
+        return True
+
     try:
         detect_script = (
             "from playwright.sync_api import sync_playwright\n"
@@ -1484,6 +1574,26 @@ class TokenBrowser:
             )
             await asyncio.sleep(warmup_seconds)
 
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        if "/404" in current_url:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 项目页重定向到 404 ({current_url[:160]})，回退打开 https://flow.google.com/projects"
+            )
+            try:
+                await page.goto(
+                    "https://flow.google.com/projects",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await asyncio.sleep(2.0)
+            except Exception as fallback_err:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} {label}回退 /projects 失败: {fallback_err}"
+                )
+
         ready = await self._wait_for_enterprise_ready(
             page,
             website_key,
@@ -1565,7 +1675,12 @@ class TokenBrowser:
             await self._cleanup_stale_slot_process()
         playwright = await async_playwright().start()
         browser_executable_path = (
-            os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
+            os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
+            or _resolve_cloakbrowser_executable()
+            or None
+        )
+        is_cloakbrowser = bool(
+            browser_executable_path and "cloakbrowser" in browser_executable_path.lower()
         )
         proxy_option, raw_proxy_url, _ = await self._resolve_proxy_runtime_config(
             token_proxy_url=token_proxy_url
@@ -1592,27 +1707,48 @@ class TokenBrowser:
                 "--hide-scrollbars",
                 "--profile-directory=Default",
                 "--disable-extensions",
-                "--disable-background-networking",
                 "--disable-sync",
                 "--disable-translate",
                 "--disable-default-apps",
                 "--no-default-browser-check",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
             ]
 
-            if launch_in_background:
+            launch_env = None
+            if is_cloakbrowser:
+                seed = random.randint(10000, 99999)
                 browser_args.extend(
                     [
-                        "--start-minimized",
-                        "--disable-background-timer-throttling",
-                        "--disable-renderer-backgrounding",
-                        "--disable-backgrounding-occluded-windows",
-                        f"--flow2api-browser-slot={self.token_id}",
+                        f"--fingerprint={seed}",
+                        "--fingerprint-platform=windows",
+                        "--ignore-gpu-blocklist",
                     ]
                 )
+                rotation_offset = int(getattr(self, "_cb_key_rotation_offset", 0) or 0)
+                selected_key, key_idx, total_keys = _select_cloakbrowser_key_for_slot(
+                    self.token_id, rotation_offset=rotation_offset
+                )
+                if selected_key:
+                    launch_env = os.environ.copy()
+                    launch_env["CLOAKBROWSER_LICENSE_KEY"] = selected_key
+                    debug_logger.log_info(
+                        f"[BrowserCaptcha] Token-{self.token_id} 绑定 CloakBrowser Key [{key_idx}/{total_keys}]: "
+                        f"{_mask_cloakbrowser_key(selected_key)}"
+                    )
+
+            browser_args.append(f"--flow2api-browser-slot={self.token_id}")
+            if launch_in_background:
+                browser_args.append("--start-minimized")
                 if sys.platform.startswith("win"):
                     browser_args.append("--window-position=-32000,-32000")
                 debug_logger.log_info(
                     f"[BrowserCaptcha] Token-{self.token_id} headed browser will launch in background mode"
+                )
+            else:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} headed browser will launch in foreground window mode (debug)"
                 )
 
             if browser_executable_path:
@@ -1620,12 +1756,15 @@ class TokenBrowser:
                     f"[BrowserCaptcha] Token-{self.token_id} using custom browser executable: {browser_executable_path}"
                 )
 
-            browser = await playwright.chromium.launch(
-                headless=False,
-                executable_path=browser_executable_path,
-                proxy=proxy_option,
-                args=browser_args,
-            )
+            launch_kwargs: Dict[str, Any] = {
+                "headless": False,
+                "executable_path": browser_executable_path,
+                "proxy": proxy_option,
+                "args": browser_args,
+            }
+            if launch_env is not None:
+                launch_kwargs["env"] = launch_env
+            browser = await playwright.chromium.launch(**launch_kwargs)
             context = await browser.new_context(
                 viewport=viewport,
                 locale="en-US",
@@ -1670,6 +1809,7 @@ class TokenBrowser:
         self._shared_keepalive_page = None
         self._shared_browser_pid = None
         self._shared_proxy_url = None
+        self._shared_launch_in_background = None
         self._shared_bound_token_id = None
         self._shared_bound_cookie_signature = None
         self._runtime_generation = getattr(self, "_runtime_generation", 0) + 1
@@ -1681,6 +1821,9 @@ class TokenBrowser:
 
         if rotate_profile:
             self._refresh_browser_profile()
+            self._cb_key_rotation_offset = (
+                int(getattr(self, "_cb_key_rotation_offset", 0) or 0) + 1
+            )
 
         if had_browser:
             debug_logger.log_info(
@@ -1734,6 +1877,20 @@ class TokenBrowser:
                 # If the proxy configuration changed, recycle the slot before reusing it.
                 await self._recycle_browser_locked(
                     reason="proxy_changed", rotate_profile=False
+                )
+                has_shared_browser = False
+
+            expected_launch_in_background = bool(
+                getattr(config, "browser_launch_background", True)
+            )
+            if (
+                has_shared_browser
+                and getattr(self, "_shared_launch_in_background", None)
+                is not None
+                and self._shared_launch_in_background != expected_launch_in_background
+            ):
+                await self._recycle_browser_locked(
+                    reason="launch_background_changed", rotate_profile=False
                 )
                 has_shared_browser = False
 
@@ -1797,6 +1954,9 @@ class TokenBrowser:
             self._shared_context = context
             await self._ensure_shared_keepalive_page()
             self._shared_proxy_url = (self._last_fingerprint or {}).get("proxy_url")
+            self._shared_launch_in_background = bool(
+                getattr(config, "browser_launch_background", True)
+            )
             self._shared_launch_count += 1
             self._shared_reuse_count = 0
             self.note_idle()
@@ -3007,12 +3167,51 @@ class TokenBrowser:
                     token_proxy_url=token_proxy_url, token_id=token_id
                 )
                 page = await context.new_page()
-                response = await page.goto(
-                    "https://flow.google.com/projects", wait_until="domcontentloaded", timeout=30000
+                # 先通过 Google 账号被动 SSO 入口触发 .google.com (__Secure-1PSIDTS / SIDCC) 与 flow.google.com (OSID) 联合续期
+                passive_sso_url = (
+                    "https://accounts.google.com/ServiceLogin"
+                    "?passive=true&continue=https%3A%2F%2Fflow.google.com%2Fprojects"
                 )
-                if urlparse(page.url).hostname != "flow.google.com" or not response or response.status != 200:
+                try:
+                    await page.goto(
+                        passive_sso_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception:
+                    pass
+                if urlparse(page.url).hostname != "flow.google.com":
+                    response = await page.goto(
+                        "https://flow.google.com/projects",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                else:
+                    response = None
+                if urlparse(page.url).hostname != "flow.google.com" or (
+                    response is not None and response.status != 200
+                ):
                     raise RuntimeError("Flow 登录已失效，请重新同步 Google Cookies")
-                email = await page.evaluate("(window.WIZ_global_data || {}).oPEP7c || ''")
+                # 等待页面内 Google RotateCookies / WIZ_global_data 完成会话滚动续期并提取邮箱
+                email = ""
+                for _ in range(14):
+                    await asyncio.sleep(0.5)
+                    try:
+                        email = await page.evaluate(
+                            """() => {
+                                const wiz = (window.WIZ_global_data || {}).oPEP7c || '';
+                                if (wiz && wiz.includes('@')) return wiz.trim();
+                                const html = document.documentElement ? document.documentElement.innerHTML : '';
+                                const m = html.match(/"oPEP7c"\\s*:\\s*"([^"@]+@[^"\\\\]+)"/);
+                                return m ? m[1].trim() : '';
+                            }"""
+                        )
+                    except Exception:
+                        email = ""
+                    if email:
+                        break
+                if not email:
+                    raise RuntimeError("Flow 页面未返回已登录账号，请重新同步 Google Cookies")
+                # 额外预留 1.5s 让页面内 RotateCookies 请求落盘 Set-Cookie
+                await asyncio.sleep(1.5)
                 cookies = [
                     cookie for cookie in await context.cookies()
                     if not is_partitioned_cookie(cookie) and (
@@ -3020,8 +3219,25 @@ class TokenBrowser:
                         or cookie["domain"].endswith(".google.com")
                     )
                 ]
+                cookies_json = json.dumps(cookies, ensure_ascii=False, separators=(",", ":"))
+                # 同步更新当前绑定签名，避免下次复用浏览器时 clear_cookies 冲掉原生会话
+                self._shared_bound_cookie_signature = (
+                    build_cookie_signature(cookies_json)
+                    or hashlib.sha256(cookies_json.encode("utf-8")).hexdigest()
+                )
+                # 让常驻保活标签页停留在 Flow 页面，挂机期间自动执行浏览器内 RotateCookies 保活
+                try:
+                    keepalive_page = await self._ensure_shared_keepalive_page()
+                    if keepalive_page and urlparse(str(keepalive_page.url or "")).hostname != "flow.google.com":
+                        await keepalive_page.goto(
+                            "https://flow.google.com/projects",
+                            wait_until="domcontentloaded",
+                            timeout=20000,
+                        )
+                except Exception:
+                    pass
                 return {
-                    "google_cookies": json.dumps(cookies, ensure_ascii=False, separators=(",", ":")),
+                    "google_cookies": cookies_json,
                     "email": email,
                 }
             finally:
@@ -3288,7 +3504,7 @@ class BrowserCaptchaService:
     
     _instance: Optional["BrowserCaptchaService"] = None
     _lock = asyncio.Lock()
-    QUEUE_WAIT_SECONDS = 30.0
+    QUEUE_WAIT_SECONDS = 600.0
     DRAIN_WAIT_SECONDS = 120.0
     RECOVERY_TIMEOUT_SECONDS = 60.0
     RECOVERY_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
@@ -3484,6 +3700,15 @@ class BrowserCaptchaService:
                 token_proxy_url=token_proxy_url,
                 token_id=token_id,
             )
+            if token_id and getattr(browser, "_shared_keepalive_page", None):
+                try:
+                    await browser._shared_keepalive_page.goto(
+                        "https://flow.google.com/projects",
+                        wait_until="domcontentloaded",
+                        timeout=25000,
+                    )
+                except Exception:
+                    pass
             debug_logger.log_info(
                 f"[BrowserCaptcha] warmed browser slot {browser_id} "
                 f"(token_id={token_id or '-'})"
@@ -3534,6 +3759,7 @@ class BrowserCaptchaService:
         warmup_targets: List[Tuple[int, Optional[Tuple[int, Optional[str]]]]] = []
 
         async with self._browsers_lock:
+            expected_launch_bg = bool(getattr(config, "browser_launch_background", True))
             if token_spec_by_id:
                 pending_specs = [
                     spec
@@ -3542,12 +3768,28 @@ class BrowserCaptchaService:
                     not in {
                         self._slot_bound_token_id(browser_id)
                         for browser_id in range(self._browser_count)
+                        if (
+                            self._browsers.get(browser_id) is not None
+                            and getattr(
+                                self._browsers.get(browser_id),
+                                "_shared_launch_in_background",
+                                expected_launch_bg,
+                            )
+                            == expected_launch_bg
+                        )
                     }
                 ]
                 for browser_id in range(self._browser_count):
                     browser = self._browsers.get(browser_id)
                     bound_token_id = self._slot_bound_token_id(browser_id)
-                    if browser is not None and bound_token_id in token_spec_by_id:
+                    if (
+                        browser is not None
+                        and bound_token_id in token_spec_by_id
+                        and getattr(
+                            browser, "_shared_launch_in_background", expected_launch_bg
+                        )
+                        == expected_launch_bg
+                    ):
                         continue
                     if not pending_specs:
                         continue
@@ -3817,7 +4059,16 @@ class BrowserCaptchaService:
     ) -> int:
         _ = project_id
         expected_token_id = TokenBrowser._normalize_token_key(token_id)
-        wait_seconds = self.QUEUE_WAIT_SECONDS if timeout_seconds is None else max(0, float(timeout_seconds))
+        default_wait_seconds = max(
+            self.QUEUE_WAIT_SECONDS,
+            float(getattr(config, "queue_timeout", 1800) or 1800),
+            float(getattr(config, "image_timeout", 300) or 300) * 2.0,
+        )
+        wait_seconds = (
+            default_wait_seconds
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
         queued_at = time.monotonic()
         deadline = queued_at + wait_seconds
         async with self._slot_condition:

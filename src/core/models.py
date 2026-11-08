@@ -1,4 +1,7 @@
-"""Data models for Flow2API"""
+"""
+核心职责：Flow2API 核心数据模型定义。
+主要功能：定义 Token、Project、CaptchaConfig（含 CloakBrowser 多 Key 配置）、PluginConfig、ChatCompletionRequest 等 Pydantic 模型。
+"""
 
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Union, Any, Literal
@@ -150,6 +153,7 @@ class GenerationConfig(BaseModel):
     id: int = 1
     image_timeout: int = 300  # seconds
     video_timeout: int = 1500  # seconds
+    queue_timeout: int = 1800  # seconds (队列排队最大等待时间)
     max_retries: int = 3  # 请求最大重试次数
 
 
@@ -190,7 +194,7 @@ class CaptchaConfig(BaseModel):
 
     id: int = 1
     captcha_method: str = (
-        "yescaptcha"  # yescaptcha/flow2api_team/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
+        "yescaptcha"  # yescaptcha/flow2api_team/captcharun/twocaptcha/capsolver/ezcaptcha/browser/cloakbrowser/personal/remote_browser
     )
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
@@ -205,6 +209,7 @@ class CaptchaConfig(BaseModel):
     captcharun_base_url: str = "https://api.captcha-run.com"
     twocaptcha_api_key: str = ""
     twocaptcha_base_url: str = "https://api.2captcha.com"
+    cloakbrowser_api_key: str = ""
     remote_browser_base_url: str = ""
     remote_browser_api_key: str = ""
     remote_browser_timeout: int = 60
@@ -213,6 +218,7 @@ class CaptchaConfig(BaseModel):
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理
     browser_proxy_url: Optional[str] = None  # 浏览器打码代理URL
     browser_count: int = 1  # 浏览器打码实例数量
+    browser_launch_background: bool = True  # 有头/CloakBrowser/内置浏览器是否静默后台运行（隐藏窗口）
     personal_project_pool_size: int = (
         4  # 单个 Token 默认维护的项目池数量（仅影响项目轮换）
     )
