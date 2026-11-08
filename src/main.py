@@ -183,11 +183,37 @@ async def lifespan(app: FastAPI):
             await browser_service.open_login_window()
             print("No active token found, opened login window for manual setup")
     elif captcha_config.captcha_method in {"browser", "cloakbrowser"}:
-        from .services.browser_captcha import BrowserCaptchaService
+        try:
+            from .services.browser_captcha import (
+                BrowserCaptchaService,
+                _resolve_cloakbrowser_executable,
+                _resolve_cloakbrowser_license_keys,
+            )
 
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        await browser_service.warmup_browser_slots()
-        print(f"Browser captcha service initialized ({captcha_config.captcha_method} mode)")
+            if captcha_config.captcha_method == "cloakbrowser":
+                cb_exe = _resolve_cloakbrowser_executable()
+                cb_keys = _resolve_cloakbrowser_license_keys()
+                if cb_exe and os.path.exists(cb_exe) and cb_keys:
+                    browser_service = await BrowserCaptchaService.get_instance(db)
+                    await browser_service.warmup_browser_slots()
+                    print("Browser captcha service initialized (cloakbrowser mode)")
+                elif cb_keys:
+                    print(
+                        "[Startup] CloakBrowser Pro binary not found; scheduling background auto-install..."
+                    )
+                    admin._schedule_captcha_runtime_prepare("cloakbrowser", force_install=True)
+                else:
+                    print(
+                        "[Startup] CloakBrowser mode selected, waiting for user to configure License Key / install kernel in Web UI."
+                    )
+            else:
+                browser_service = await BrowserCaptchaService.get_instance(db)
+                await browser_service.warmup_browser_slots()
+                print(f"Browser captcha service initialized ({captcha_config.captcha_method} mode)")
+        except Exception as e:
+            print(
+                f"[Startup] Browser captcha warmup skipped ({captcha_config.captcha_method}): {type(e).__name__}: {e}"
+            )
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)

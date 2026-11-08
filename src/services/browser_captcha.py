@@ -415,21 +415,22 @@ def install_cloakbrowser_runtime(api_key: Optional[str] = None) -> Dict[str, Any
 
 
 def _ensure_browser_installed() -> bool:
-    """确保浏览器已安装。
+    """确保浏览器已安装（模块导入期检查，不阻塞 Web 服务启动）。
 
-    若打码方式为 cloakbrowser，则严格要求 CloakBrowser Pro 内核及 License Key 必须存在，
-    绝不降级或回退为普通 Chromium；缺失时直接抛出异常，提示用户一键安装或更换打码方式。
+    若打码方式为 cloakbrowser，仅检查 CloakBrowser Pro 内核及 License Key 状态并更新 runtime_status，
+    绝不回退安装普通 Chromium；真正的硬性拦截在 TokenBrowser._create_browser 启动实例时抛出 RuntimeError，
+    从而保证 Web 管理后台始终能正常启动供用户点击「一键安装/修复内核」或切换打码方式。
     """
     if config.captcha_method == "cloakbrowser":
         cb_executable = _resolve_cloakbrowser_executable()
         if not cb_executable or not os.path.exists(cb_executable):
             err_msg = (
-                "当前打码方式为 [cloakbrowser]，但未检测到 CloakBrowser Pro 内核文件！"
+                "当前打码方式为 [cloakbrowser]，尚未检测到 CloakBrowser Pro 内核文件。"
                 "请在管理后台「验证码配置 -> CloakBrowser打码」中点击「一键安装/修复内核」，或更换其他打码方式。"
             )
-            debug_logger.log_error(f"[BrowserCaptcha] ❌ {err_msg}")
+            debug_logger.log_warning(f"[BrowserCaptcha] ⚠️ {err_msg}")
             fail_runtime_prepare("cloakbrowser", err_msg)
-            raise RuntimeError(err_msg)
+            return False
 
         keys = _resolve_cloakbrowser_license_keys()
         if not keys:
@@ -437,9 +438,9 @@ def _ensure_browser_installed() -> bool:
                 "当前打码方式为 [cloakbrowser]，但未配置任何 License Key！"
                 "请在管理后台「打码配置」输入授权码，或在环境变量设置 CLOAKBROWSER_LICENSE_KEY，或更换其他打码方式。"
             )
-            debug_logger.log_error(f"[BrowserCaptcha] ❌ {err_msg}")
+            debug_logger.log_warning(f"[BrowserCaptcha] ⚠️ {err_msg}")
             fail_runtime_prepare("cloakbrowser", err_msg)
-            raise RuntimeError(err_msg)
+            return False
 
         debug_logger.log_info(
             f"[BrowserCaptcha] CloakBrowser Pro 浏览器与授权已就绪: {cb_executable} (共 {len(keys)} 个 Key)"

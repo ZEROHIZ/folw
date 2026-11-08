@@ -125,7 +125,8 @@
 - **修复方案**：
   1. 在 [`src/core/database.py`](src/core/database.py) 的 `init_db()` 与 `update_captcha_config()` 中补齐 `_migrate_columns_for_table` 自动字段迁移（使用标准 `print` 输出避免未定义 logger 变量）。
   2. 在 [`src/services/browser_captcha.py`](src/services/browser_captcha.py) 中新增 `get_cloakbrowser_env_status()` 与 `install_cloakbrowser_runtime()`，在 [`src/api/admin.py`](src/api/admin.py) 新增 `GET /api/captcha/cloakbrowser/status` 与 `POST /api/captcha/cloakbrowser/install` 接口，并在保存 `cloakbrowser` 配置且缺失内核时自动调用 `setup_cloakbrowser.py` 下载安装（同时在打码执行阶段保持严格校验、绝不回退普通 Chromium）。
-  3. 在 [`static/manage.html`](static/manage.html) 的「CloakBrowser打码」配置区新增「🔍 检测环境」与「⬇️ 一键安装/修复内核」按钮及实时状态/进度面板。
+  3. 将 [`_ensure_browser_installed()`](src/services/browser_captcha.py) 模块导入期的检查改为返回 `False`（不抛异常阻塞 FastAPI 启动，真正硬性拦截保留在 `TokenBrowser._create_browser()` 实例创建阶段），并在 [`src/main.py`](src/main.py) 启动生命周期中对缺失内核但已配置 Key 的场景自动触发后台异步安装，避免容器因数据库记录为 `cloakbrowser` 且尚未安装内核而无限重启。
+  4. 在 [`static/manage.html`](static/manage.html) 的「CloakBrowser打码」配置区新增「🔍 检测环境」与「⬇️ 一键安装/修复内核」按钮及实时状态/进度面板。
 
 
 
