@@ -1176,9 +1176,9 @@ class Database:
             if not await self._column_exists(db, table_name, col_name):
                 try:
                     await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
-                    debug_logger.log_info(f"[Database] 自动补齐数据表缺失字段: {table_name}.{col_name}")
+                    print(f"[Database] ✓ 自动补齐数据表缺失字段: {table_name}.{col_name}")
                 except Exception as e:
-                    debug_logger.log_warning(f"[Database] 补齐字段失败 {table_name}.{col_name}: {e}")
+                    print(f"[Database] ✗ 补齐字段失败 {table_name}.{col_name}: {e}")
 
     async def _ensure_token_identity_available(
         self,
@@ -2749,7 +2749,7 @@ class Database:
                     try:
                         await db.execute(f"ALTER TABLE captcha_config ADD COLUMN {col} {col_def}")
                     except Exception as e:
-                        debug_logger.log_warning(f"[Database] 补齐字段 {col} 失败: {e}")
+                        print(f"[Database] 补齐字段 {col} 失败: {e}")
 
             # Keep the new provider update in the same transaction as the existing fields.
             previous_captcha = dict(row) if row else {}
