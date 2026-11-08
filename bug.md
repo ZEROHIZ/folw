@@ -127,6 +127,11 @@
   2. 在 [`src/services/browser_captcha.py`](src/services/browser_captcha.py) 中新增 `get_cloakbrowser_env_status()` 与 `install_cloakbrowser_runtime()`，在 [`src/api/admin.py`](src/api/admin.py) 新增 `GET /api/captcha/cloakbrowser/status` 与 `POST /api/captcha/cloakbrowser/install` 接口，并在保存 `cloakbrowser` 配置且缺失内核时自动调用 `setup_cloakbrowser.py` 下载安装（同时在打码执行阶段保持严格校验、绝不回退普通 Chromium）。
   3. 将 [`_ensure_browser_installed()`](src/services/browser_captcha.py) 模块导入期的检查改为返回 `False`（不抛异常阻塞 FastAPI 启动，真正硬性拦截保留在 `TokenBrowser._create_browser()` 实例创建阶段），并在 [`src/main.py`](src/main.py) 启动生命周期中对缺失内核但已配置 Key 的场景自动触发后台异步安装，避免容器因数据库记录为 `cloakbrowser` 且尚未安装内核而无限重启。
   4. 在 [`static/manage.html`](static/manage.html) 的「CloakBrowser打码」配置区新增「🔍 检测环境」与「⬇️ 一键安装/修复内核」按钮及实时状态/进度面板。
+  5. **修复 CloakBrowser Pro 启动报 `TargetClosedError` (`exitCode=76`) 与指纹覆盖问题**（[`src/services/browser_captcha.py`](src/services/browser_captcha.py)）：
+     - 定位到 `TargetClosedError: BrowserType.launch: Target page, context or browser has been closed` 的底层退出码为 `exitCode=76`（CloakBrowser 免费 Key 限制 1 个并发会话，当 Docker 容器与本地同时共用同一个免费 Key，或切换账号 `token_binding_changed` 频繁销毁重建浏览器时触发云端会话上限拒绝）。
+     - 移除 `_get_or_create_shared_browser` 中因 `token_binding_changed` 销毁重启整个浏览器进程的逻辑（直接复用同一个常驻 CloakBrowser 实例并在 context 内切换账号 Cookie）；
+     - 在 CloakBrowser 模式下禁用冗余的 JS 原型链指纹注入补丁（`_apply_browser_environment_patch`）并启用 `no_viewport=True`，保持 C++ 原生防检测指纹纯净；
+     - 在 `_create_browser` 中识别 `exitCode=76/77/78`，支持多 Key 自动轮换重试与中文明确报错，并在环境检测接口中返回实时云端并发槽位占用（`seats_active / seats_limit`）。
 
 
 

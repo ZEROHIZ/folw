@@ -1239,7 +1239,12 @@
             }
             if(keyEl){
                 const cnt=Number(data.keys_count||0);
-                keyEl.textContent=cnt>0?`✅ 已配置 ${cnt} 个 (${(data.masked_keys||[]).join(', ')})`:'⚠️ 未配置 Key';
+                let seatText='';
+                if(data.seats_active!==null&&data.seats_active!==undefined){
+                    const lim=data.seats_limit!==null&&data.seats_limit!==undefined?data.seats_limit:'∞';
+                    seatText=` | 并发槽位: ${data.seats_active}/${lim}`;
+                }
+                keyEl.textContent=cnt>0?`✅ 已配置 ${cnt} 个 (${(data.masked_keys||[]).join(', ')})${seatText}`:'⚠️ 未配置 Key';
                 keyEl.className=`font-medium ${cnt>0?'text-green-600':'text-amber-600'}`;
             }
             if(binRow&&binPath){

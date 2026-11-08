@@ -296,6 +296,20 @@ def get_cloakbrowser_env_status() -> Dict[str, Any]:
     masked_keys = [_mask_cloakbrowser_key(k) for k in keys]
     rt_status = get_runtime_status("cloakbrowser")
 
+    seats_active = None
+    seats_limit = None
+    seats_state = "unknown"
+    if pkg_installed and keys:
+        try:
+            from cloakbrowser.license import get_session_seats
+
+            seat_info = get_session_seats(keys[0])
+            seats_active = getattr(seat_info, "active", None)
+            seats_limit = getattr(seat_info, "limit", None)
+            seats_state = str(getattr(seat_info, "state", "ok") or "ok")
+        except Exception:
+            pass
+
     return {
         "pkg_installed": pkg_installed,
         "pkg_version": pkg_version,
@@ -305,6 +319,9 @@ def get_cloakbrowser_env_status() -> Dict[str, Any]:
         "cache_dir": cache_dir,
         "keys_count": len(keys),
         "masked_keys": masked_keys,
+        "seats_active": seats_active,
+        "seats_limit": seats_limit,
+        "seats_state": seats_state,
         "in_docker": IS_DOCKER,
         "display": os.environ.get("DISPLAY", ""),
         "ready": bool(pkg_installed and kernel_installed and len(keys) > 0),
@@ -1276,6 +1293,11 @@ class TokenBrowser:
         if target is None:
             return False
 
+        # CloakBrowser Pro 已在 C++ 二进制底层原生接管全套指纹，禁止再叠加 JS 原型链覆写补丁，
+        # 否则会破坏原生 C++ 指纹一致性并触发 reCAPTCHA Enterprise 降分 / 500 错误。
+        if getattr(self, "_is_cloakbrowser", False) or getattr(config, "captcha_method", "") == "cloakbrowser":
+            return True
+
         signature = str(getattr(self, "_profile_env_seed", "") or "")
         if getattr(target, "_flow2api_environment_patch_signature", None) == signature:
             return True
@@ -1924,6 +1946,10 @@ class TokenBrowser:
             ]
 
             launch_env = None
+            selected_key = None
+            key_idx = 0
+            total_keys = 0
+            self._is_cloakbrowser = bool(is_cloakbrowser)
             if is_cloakbrowser:
                 seed = random.randint(10000, 99999)
                 browser_args.extend(
@@ -1971,11 +1997,61 @@ class TokenBrowser:
             }
             if launch_env is not None:
                 launch_kwargs["env"] = launch_env
-            browser = await playwright.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(
-                viewport=viewport,
-                locale="en-US",
-            )
+
+            browser = None
+            max_key_tries = max(1, total_keys) if is_cloakbrowser else 1
+            for key_try in range(max_key_tries):
+                try:
+                    browser = await playwright.chromium.launch(**launch_kwargs)
+                    break
+                except Exception as launch_exc:
+                    err_text = str(launch_exc or "")
+                    if is_cloakbrowser and "exitCode=76" in err_text:
+                        self._cb_key_rotation_offset = (
+                            int(getattr(self, "_cb_key_rotation_offset", 0) or 0) + 1
+                        )
+                        if key_try + 1 < max_key_tries:
+                            next_key, next_idx, _ = _select_cloakbrowser_key_for_slot(
+                                self.token_id,
+                                rotation_offset=self._cb_key_rotation_offset,
+                            )
+                            if next_key and launch_env is not None:
+                                selected_key = next_key
+                                key_idx = next_idx
+                                launch_env["CLOAKBROWSER_LICENSE_KEY"] = next_key
+                                launch_kwargs["env"] = launch_env
+                                debug_logger.log_warning(
+                                    f"[BrowserCaptcha] Token-{self.token_id} 当前 Key 并发槽位已满 (exitCode=76)，"
+                                    f"自动切换下一个 Key [{key_idx}/{total_keys}]: {_mask_cloakbrowser_key(next_key)}"
+                                )
+                                continue
+                        seat_msg = (
+                            f"CloakBrowser Pro 授权并发槽位已满 (exitCode=76)：Key ({_mask_cloakbrowser_key(selected_key)}) "
+                            f"为免费版（仅支持 1 个并发浏览器实例）！当前该 Key 正被另一端（如您的 Docker 容器或未退出的旧浏览器）占用，"
+                            f"或刚强制关闭尚未释放（免费 Key 异常退出后约 1~4 分钟自动释放槽位）。"
+                            f"请不要在 Docker 与本地同时共用同一个免费 Key，或在后台配置多个免费 cb_ Key！"
+                        )
+                        raise RuntimeError(seat_msg) from launch_exc
+                    if is_cloakbrowser and "exitCode=77" in err_text:
+                        raise RuntimeError(
+                            f"CloakBrowser Pro License Key 无效或已过期 (exitCode=77): {_mask_cloakbrowser_key(selected_key)}"
+                        ) from launch_exc
+                    if is_cloakbrowser and "exitCode=78" in err_text:
+                        raise RuntimeError(
+                            "CloakBrowser Pro 无法连接授权验证服务器 (exitCode=78)，请检查网络或代理连接。"
+                        ) from launch_exc
+                    raise
+
+            if is_cloakbrowser:
+                context = await browser.new_context(
+                    no_viewport=True,
+                    locale="en-US",
+                )
+            else:
+                context = await browser.new_context(
+                    viewport=viewport,
+                    locale="en-US",
+                )
             await self._apply_browser_environment_patch(context, label="context")
             browser_pid = self._extract_browser_pid(browser)
             if manage_slot_pid:
@@ -1986,7 +2062,7 @@ class TokenBrowser:
             return playwright, browser, context
         except Exception as e:
             debug_logger.log_error(
-                f"[BrowserCaptcha] Token-{self.token_id} browser launch failed: {type(e).__name__}: {str(e)[:200]}"
+                f"[BrowserCaptcha] Token-{self.token_id} browser launch failed: {type(e).__name__}: {str(e)[:400]}"
             )
             try:
                 if playwright:
@@ -2101,18 +2177,8 @@ class TokenBrowser:
                 )
                 has_shared_browser = False
 
-            if has_shared_browser:
-                current_bound_token = self._shared_bound_token_id
-                token_changed = expected_token_key != current_bound_token and not (
-                    expected_token_key is None and current_bound_token is None
-                )
-                if token_changed:
-                    await self._recycle_browser_locked(
-                        reason=f"token_binding_changed:{current_bound_token}->{expected_token_key}",
-                        rotate_profile=False,
-                    )
-                    has_shared_browser = False
-
+            # 注意：切换业务账号 (token_id) 时，无需重启整个浏览器进程（下方 _ensure_shared_token_binding
+            # 会直接在现有 context 中清理并注入新账号 Cookie），避免 CloakBrowser 免费 Key (1 并发) 因频繁重启产生 exitCode=76 槽位冲突。
             if has_shared_browser:
                 try:
                     await self._ensure_shared_keepalive_page()
